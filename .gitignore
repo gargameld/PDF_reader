@@ -1,0 +1,22 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Build outputs
+build/
+dist/
+*.spec.bak
+
+# Local reader state and generated debug artifacts
+a.txt
+solid_state.txt
+ocr_snippets/
+selection_equations/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Installer outputs
+installer/Output/
