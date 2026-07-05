@@ -8,6 +8,7 @@ A PySide6/PyMuPDF desktop PDF reader focused on fast textbook navigation:
 - Search text across a PDF.
 - Add bookmarks, comments, and selection lines.
 - Create a new PDF from selected PDF pages and images.
+- Browse Google Drive PDFs/Docs and lazily download cloud documents when opened.
 
 ## Requirements
 
@@ -46,6 +47,16 @@ The reader can detect equation references from the PDF text layer near the click
 For scanned/image-only PDFs, text-layer lookup will not work. The OCR fallback currently uses Apple's Swift/Vision framework on macOS only.
 
 Use `Ctrl+D` to scan/rebuild the equation index for the current book.
+
+## Google Drive
+
+Users can click `Sign In Drive` in the app menu and sign in with their own Google account. The app uses one bundled OAuth client ID, but each user authorizes and sees only their own Drive files.
+
+Cloud documents are loaded from a Google Drive folder named `PDF Reader`. The app can create that folder and upload local PDFs into it from the `Upload Cloud` button, or by right-clicking a local document in the menu and choosing `Upload to Cloud`. You can also place PDFs, Google Docs, Sheets, or Slides there to show them in the app.
+
+For development, `google_oauth_client.json` next to the app or `PDF_READER_GOOGLE_CLIENT_ID` / `PDF_READER_GOOGLE_CLIENT_SECRET` environment variables override the bundled client.
+
+The app requests Drive read access plus file access for documents it creates/uploads. Cloud documents are listed from Drive metadata; the PDF file is cached locally only after the document is opened.
 
 ## Windows Compatibility
 

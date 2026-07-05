@@ -12,6 +12,9 @@ a.txt
 solid_state.txt
 ocr_snippets/
 selection_equations/
+cloud_documents/
+google_drive_token.json
+google_oauth_client.json
 
 # Virtual environments
 .venv/

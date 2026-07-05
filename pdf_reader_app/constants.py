@@ -22,12 +22,42 @@ SHORTCUT_COPY_BETWEEN_LINES = "Shift+C"
 SHORTCUT_CLEAR_SELECTION_LINES = "Shift+X"
 SHORTCUT_PREVIEW_EQUATION = "Shift+P"
 SHORTCUT_OPEN_TEXT_SEARCH = "Shift+F"
+SHORTCUT_SPLIT_VIEWER = "Shift+W"
+SHORTCUT_CLOSE_VIEWER = "Shift+Q"
 SHORTCUT_RETURN_TO_TEXT_SEARCH_SOURCE = "Ctrl+2"
 SHORTCUT_SCAN_EQUATION_INDEX = "Ctrl+D"
 SHORTCUT_LEARN_EQUATION_RECTANGLE = "Ctrl+R"
 SHORTCUT_CREATE_COMMENT = "Ctrl+T"
 SHORTCUT_TOGGLE_EQUATION_LOOKUP = "Ctrl+G"
 SHORTCUT_TOGGLE_LAST_DOCUMENTS = ("Ctrl+`", "Ctrl+~")
+
+SHORTCUT_DEFINITIONS = (
+    ("menu", "Menu", "Meta+M"),
+    ("open_pdfs", "Open PDFs", SHORTCUT_OPEN),
+    ("toggle_last_documents", "Toggle Last Documents", SHORTCUT_TOGGLE_LAST_DOCUMENTS[0]),
+    ("close_document", "Close Document", SHORTCUT_CLOSE_DOCUMENT),
+    ("back", "Back", SHORTCUT_BACK),
+    ("forward", "Forward", SHORTCUT_FORWARD),
+    ("previous_page", "Previous Page", SHORTCUT_PREVIOUS_PAGE),
+    ("next_page", "Next Page", SHORTCUT_NEXT_PAGE),
+    ("zoom_in", "Zoom In", SHORTCUT_ZOOM_IN),
+    ("zoom_out", "Zoom Out", SHORTCUT_ZOOM_OUT),
+    ("jump_to_equation", "Jump to Equation", SHORTCUT_JUMP_TO_EQUATION),
+    ("toggle_bookmarks", "Toggle Bookmarks", SHORTCUT_TOGGLE_BOOKMARKS),
+    ("add_bookmark", "Add Bookmark", SHORTCUT_ADD_BOOKMARK),
+    ("return_to_equation_source", "Return to Equation Source", SHORTCUT_RETURN_TO_EQUATION_SOURCE),
+    ("copy_between_lines", "Copy Between Blue Lines", SHORTCUT_COPY_BETWEEN_LINES),
+    ("clear_selection_lines", "Clear Blue Lines", SHORTCUT_CLEAR_SELECTION_LINES),
+    ("preview_equation", "Preview Equation Under Cursor", SHORTCUT_PREVIEW_EQUATION),
+    ("open_text_search", "Search Text", SHORTCUT_OPEN_TEXT_SEARCH),
+    ("split_viewer", "Split Viewer", SHORTCUT_SPLIT_VIEWER),
+    ("close_viewer", "Close Viewer", SHORTCUT_CLOSE_VIEWER),
+    ("return_to_text_search_source", "Return to Text Search Source", SHORTCUT_RETURN_TO_TEXT_SEARCH_SOURCE),
+    ("scan_equation_index", "Scan Equation Index", SHORTCUT_SCAN_EQUATION_INDEX),
+    ("learn_equation_rectangle", "Learn Equation Rectangle", SHORTCUT_LEARN_EQUATION_RECTANGLE),
+    ("create_comment", "Create Comment", SHORTCUT_CREATE_COMMENT),
+    ("toggle_equation_lookup", "Toggle Equation Lookup", SHORTCUT_TOGGLE_EQUATION_LOOKUP),
+)
 
 KEYBOARD_LAYOUT_FALLBACKS = {
     # Hebrew keyboard layout characters in the same physical positions as US
@@ -99,6 +129,10 @@ SHORTCUT_KEY_CODES = {
     "~": Qt.Key_AsciiTilde,
     "-": Qt.Key_Minus,
     "+": Qt.Key_Plus,
+    "LEFT": Qt.Key_Left,
+    "RIGHT": Qt.Key_Right,
+    "UP": Qt.Key_Up,
+    "DOWN": Qt.Key_Down,
 }
 
 MACOS_NATIVE_VIRTUAL_KEYS = {

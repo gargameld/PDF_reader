@@ -25,6 +25,11 @@ def _parse_session_data_from_lines(lines: List[str]) -> Optional[SessionPersiste
                 for key, value in dict(data.get("equation_macros", {}) or {}).items()
                 if str(key)
             },
+            shortcut_overrides={
+                str(key): str(value)
+                for key, value in dict(data.get("shortcut_overrides", {}) or {}).items()
+                if str(key)
+            },
         )
     except Exception as exc:
         raise ValueError(f"Invalid session-state JSON in a.txt: {exc}") from exc
@@ -132,6 +137,7 @@ def write_a_txt(
                     "documents": session_data.documents,
                     "recent_documents": session_data.recent_documents,
                     "equation_macros": session_data.equation_macros,
+                    "shortcut_overrides": session_data.shortcut_overrides,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -274,4 +280,3 @@ def extract_section_starts_from_toc(doc: fitz.Document) -> Dict[Tuple[int, ...],
             section_starts[section] = page
 
     return dict(sorted(section_starts.items()))
-

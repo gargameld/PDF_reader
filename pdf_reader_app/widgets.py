@@ -432,6 +432,25 @@ class PdfView(QGraphicsView):
         current = self.current_visible_page()
         return self._page_pixmaps.get(current) if current is not None else None
 
+    def visible_pages(self) -> List[int]:
+        if not self._page_order:
+            return []
+
+        scene_rect = self.mapToScene(self.viewport().rect()).boundingRect()
+        top = scene_rect.top()
+        bottom = scene_rect.bottom()
+        pages: List[int] = []
+
+        start_index = max(0, bisect_right(self._page_tops, top) - 1)
+        for index in range(start_index, len(self._page_order)):
+            page = self._page_order[index]
+            _page_x, page_y, _page_w, page_h = self._page_offsets[page]
+            if page_y > bottom:
+                break
+            if page_y + page_h >= top:
+                pages.append(page)
+        return pages
+
     def page_at_scene_pos(self, scene_x: float, scene_y: float) -> Optional[Tuple[int, float, float]]:
         if not self._page_tops:
             return None
@@ -526,6 +545,10 @@ class PdfView(QGraphicsView):
         shifted_anchor = self.mapFromScene(anchor_scene)
         self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + shifted_anchor.x() - anchor.x())
         self.verticalScrollBar().setValue(self.verticalScrollBar().value() + shifted_anchor.y() - anchor.y())
+        self.view_changed.emit()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
         self.view_changed.emit()
 
     def wheelEvent(self, event) -> None:

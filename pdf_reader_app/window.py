@@ -1,4 +1,5 @@
 import html
+import json
 import re
 import subprocess
 import sys
@@ -12,8 +13,11 @@ from PySide6.QtGui import QAction, QCloseEvent, QColor, QCursor, QDesktopService
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -21,12 +25,14 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
     QStackedWidget,
     QStatusBar,
     QTabBar,
@@ -40,9 +46,136 @@ from PySide6.QtWidgets import (
 
 from .application import PdfReaderApplication
 from .constants import *
+from .google_drive import DRIVE_FOLDER_NAME, CloudDocument, GoogleDriveClient, GoogleDriveError
 from .models import *
 from .session import *
 from .widgets import *
+
+class ShortcutSettingsDialog(QDialog):
+    def __init__(
+        self,
+        definitions: List[Tuple[str, str, str]],
+        shortcuts: Dict[str, str],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Shortcuts")
+        self.resize(560, 620)
+        self._definitions = definitions
+        self._shortcuts = dict(shortcuts)
+        self._buttons: Dict[str, QPushButton] = {}
+        self._listening_id: Optional[str] = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        hint = QLabel("Click a shortcut, then press the new keys. Esc cancels; Backspace clears.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        grid = QGridLayout(content)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 0)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(8)
+
+        for row, (shortcut_id, title, default_shortcut) in enumerate(self._definitions):
+            label = QLabel(title)
+            label.setToolTip(f"Default: {default_shortcut}")
+            button = QPushButton(self._shortcuts.get(shortcut_id, ""))
+            button.setMinimumWidth(150)
+            button.clicked.connect(lambda _checked=False, sid=shortcut_id: self._listen_for_shortcut(sid))
+            reset_button = QPushButton("Reset")
+            reset_button.clicked.connect(lambda _checked=False, sid=shortcut_id, default=default_shortcut: self._set_shortcut(sid, default))
+            grid.addWidget(label, row, 0)
+            grid.addWidget(button, row, 1)
+            grid.addWidget(reset_button, row, 2)
+            self._buttons[shortcut_id] = button
+
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def shortcuts(self) -> Dict[str, str]:
+        return dict(self._shortcuts)
+
+    def _listen_for_shortcut(self, shortcut_id: str) -> None:
+        self._listening_id = shortcut_id
+        self._buttons[shortcut_id].setText("Press keys...")
+        self._buttons[shortcut_id].setFocus()
+
+    def _set_shortcut(self, shortcut_id: str, shortcut: str) -> None:
+        self._shortcuts[shortcut_id] = shortcut
+        self._buttons[shortcut_id].setText(shortcut or "None")
+        self._listening_id = None
+
+    def keyPressEvent(self, event) -> None:
+        if self._listening_id is None:
+            super().keyPressEvent(event)
+            return
+
+        if event.key() == Qt.Key_Escape:
+            self._buttons[self._listening_id].setText(self._shortcuts.get(self._listening_id, "") or "None")
+            self._listening_id = None
+            event.accept()
+            return
+
+        if event.key() in (Qt.Key_Backspace, Qt.Key_Delete):
+            self._set_shortcut(self._listening_id, "")
+            event.accept()
+            return
+
+        shortcut = self._shortcut_from_event(event)
+        if shortcut:
+            self._set_shortcut(self._listening_id, shortcut)
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
+    @staticmethod
+    def _shortcut_from_event(event) -> str:
+        key = event.key()
+        if key in (
+            Qt.Key_Control,
+            Qt.Key_Shift,
+            Qt.Key_Alt,
+            Qt.Key_Meta,
+            Qt.Key_AltGr,
+        ):
+            return ""
+
+        parts: List[str] = []
+        modifiers = event.modifiers()
+        if modifiers & Qt.ControlModifier:
+            parts.append("Ctrl")
+        if modifiers & Qt.AltModifier:
+            parts.append("Alt")
+        if modifiers & Qt.ShiftModifier:
+            parts.append("Shift")
+        if modifiers & Qt.MetaModifier:
+            parts.append("Meta")
+
+        key_name = ""
+        for candidate, qt_key in SHORTCUT_KEY_CODES.items():
+            if key == qt_key:
+                key_name = candidate.title() if len(candidate) > 1 else candidate
+                break
+        if not key_name:
+            key_name = QKeySequence(key).toString(QKeySequence.PortableText)
+        if not key_name:
+            return ""
+        if key_name == "+":
+            return "+".join(parts) + "++" if parts else "+"
+        parts.append(key_name)
+        return "+".join(parts)
 
 class PdfReaderWindow(QMainWindow):
     def __init__(self) -> None:
@@ -55,17 +188,29 @@ class PdfReaderWindow(QMainWindow):
         self.a_txt_path = self.base_dir / "a.txt"
         self.snippet_dir = self.base_dir / "ocr_snippets"
         self.snippet_dir.mkdir(exist_ok=True)
+        self.cloud_cache_dir = self.base_dir / "cloud_documents"
 
         self.sessions: List[DocumentSession] = []
         self.current_index: int = -1
         self._suspend_history = False
         self._switching_docs = False
-        self._view_session_id: Optional[int] = None
         self.recent_documents: List[str] = []
         self.recent_document_entries: Dict[str, dict] = {}
         self.document_activation_history: List[str] = []
         self._thumbnail_cache: Dict[str, QPixmap] = {}
+        self._cloud_thumbnail_cache: Dict[str, QPixmap] = {}
+        self.cloud_documents: List[CloudDocument] = []
+        self.google_drive = GoogleDriveClient(
+            self.base_dir / "google_drive_token.json",
+            self.cloud_cache_dir,
+            self.base_dir / "google_oauth_client.json",
+        )
         self._layout_independent_shortcuts: List[Tuple[QAction, Qt.KeyboardModifiers, str]] = []
+        self._shortcut_actions: Dict[str, QAction] = {}
+        self._shortcut_defaults: Dict[str, str] = {
+            shortcut_id: default for shortcut_id, _title, default in SHORTCUT_DEFINITIONS
+        }
+        self.shortcut_overrides: Dict[str, str] = {}
 
         self.default_chapter_starts: Optional[Dict[int, int]] = None
         self.startup_session_data: Optional[SessionPersistence] = None
@@ -101,17 +246,19 @@ class PdfReaderWindow(QMainWindow):
         )
         if self.startup_session_data and self.startup_session_data.equation_macros:
             self.equation_macros.update(self.startup_session_data.equation_macros)
+        if self.startup_session_data and self.startup_session_data.shortcut_overrides:
+            self.shortcut_overrides = {
+                shortcut_id: shortcut
+                for shortcut_id, shortcut in self.startup_session_data.shortcut_overrides.items()
+                if shortcut_id in self._shortcut_defaults
+            }
 
-        self.view = PdfView()
-        self.view.view_changed.connect(self._on_view_changed)
-        self.view.clicked.connect(self.jump_if_reference_clicked)
-        self.view.right_clicked.connect(self.research_equation_reference_clicked)
-        self.view.link_click_requested.connect(self.open_link_clicked)
-        self.view.selection_line_requested.connect(self.add_selection_line_at_position)
-        self.view.pdf_files_dropped.connect(self.open_dropped_pdfs)
-        self.view.hover_moved.connect(self._schedule_equation_preview)
-        self.view.hover_left.connect(self._hide_equation_preview)
-        self.view.comment_clicked.connect(self.open_comment_at_index)
+        self.reader_splitter = QSplitter(Qt.Vertical)
+        self.reader_splitter.setChildrenCollapsible(False)
+        self.reader_views: List[PdfView] = []
+        self._view_frames: Dict[PdfView, QFrame] = {}
+        self.view = self._create_pdf_view()
+        self._add_reader_view(self.view)
 
         self.doc_tabs = QTabBar()
         self.doc_tabs.setAutoHide(False)
@@ -205,7 +352,7 @@ class PdfReaderWindow(QMainWindow):
         reader_page = QWidget()
         layout = QVBoxLayout(reader_page)
         layout.addWidget(self.doc_tabs)
-        layout.addWidget(self.view)
+        layout.addWidget(self.reader_splitter)
 
         bottom = QHBoxLayout()
         bottom.addWidget(self.status_label)
@@ -223,15 +370,196 @@ class PdfReaderWindow(QMainWindow):
         self._refresh_bookmarks_panel()
         self.view.setFocus()
 
-    def _create_action(self, text: str, shortcut: str, handler) -> QAction:
+    def _create_pdf_view(self) -> PdfView:
+        view = PdfView()
+        view.view_changed.connect(self._on_view_changed)
+        view.clicked.connect(lambda page, x, y, v=view: self._activate_and_call(v, self.jump_if_reference_clicked, page, x, y))
+        view.right_clicked.connect(lambda page, x, y, v=view: self._activate_and_call(v, self.research_equation_reference_clicked, page, x, y))
+        view.link_click_requested.connect(lambda page, x, y, v=view: self._activate_and_call(v, self.open_link_clicked, page, x, y))
+        view.selection_line_requested.connect(lambda page, x, y, v=view: self._activate_and_call(v, self.add_selection_line_at_position, page, x, y))
+        view.pdf_files_dropped.connect(lambda paths, v=view: self._activate_and_call(v, self.open_dropped_pdfs, paths))
+        view.hover_moved.connect(lambda page, x, y, pos, v=view: self._schedule_equation_preview(page, x, y, pos) if v is self.view else None)
+        view.hover_left.connect(self._hide_equation_preview)
+        view.comment_clicked.connect(lambda index, v=view: self._activate_and_call(v, self.open_comment_at_index, index))
+        view._pdf_reader_session_id = None
+        return view
+
+    def _add_reader_view(self, view: PdfView, index: Optional[int] = None) -> None:
+        frame = QFrame()
+        frame.setObjectName("readerPaneFrame")
+        frame_layout = QVBoxLayout(frame)
+        frame_layout.setContentsMargins(2, 2, 2, 2)
+        frame_layout.setSpacing(0)
+        frame_layout.addWidget(view)
+
+        self._view_frames[view] = frame
+        if index is None or index >= self.reader_splitter.count():
+            self.reader_views.append(view)
+            self.reader_splitter.addWidget(frame)
+        else:
+            self.reader_views.insert(index, view)
+            self.reader_splitter.insertWidget(index, frame)
+        self._refresh_active_view_styles()
+
+    def _activate_and_call(self, view: PdfView, handler, *args) -> None:
+        self._set_active_view(view)
+        handler(*args)
+
+    def _set_active_view(self, view: PdfView, focus: bool = False) -> None:
+        if view not in self.reader_views:
+            return
+        if self.view is not view:
+            self._save_active_session_view()
+            self.view = view
+            self._sync_text_search_panel()
+            self._redraw_selection_lines()
+            session = self.current_session()
+            if session is not None:
+                self._ensure_rendered_visible_pages(session, view)
+                self._capture_session_view_layout(session)
+        self._refresh_active_view_styles()
+        self._update_status()
+        if focus:
+            view.setFocus()
+
+    def _refresh_active_view_styles(self) -> None:
+        for view, frame in self._view_frames.items():
+            color = "#1976D2" if len(self.reader_views) > 1 and view is self.view else "transparent"
+            frame.setStyleSheet(
+                "QFrame#readerPaneFrame { "
+                f"border: 2px solid {color}; "
+                "padding: 0px; "
+                "background: transparent; "
+                "}"
+            )
+
+    def _view_for_event_object(self, obj) -> Optional[PdfView]:
+        for view in self.reader_views:
+            if obj is view or obj is view.viewport():
+                return view
+        return None
+
+    def _clear_reader_views(self) -> None:
+        for view, frame in list(self._view_frames.items()):
+            frame.setParent(None)
+            frame.deleteLater()
+            view._pdf_reader_session_id = None
+        self.reader_views = []
+        self._view_frames = {}
+
+    def _capture_session_view_layout(self, session: DocumentSession) -> None:
+        states: List[ViewState] = []
+        active_index = 0
+        for view in self.reader_views:
+            if not self._view_has_session(session, view):
+                continue
+            if view is self.view:
+                active_index = len(states)
+            state = self._view_state_for_view(view)
+            if state is not None:
+                states.append(state)
+
+        if not states:
+            state = self._current_view_state()
+            if state is not None:
+                states = [state]
+                active_index = 0
+
+        if not states:
+            return
+
+        active_index = max(0, min(active_index, len(states) - 1))
+        session.viewer_states = states[:3]
+        session.active_view_index = active_index
+        session.saved_view_state = session.viewer_states[active_index]
+        session.current_page = session.saved_view_state.page
+
+    def _rebuild_reader_views_for_session(self, session: DocumentSession) -> None:
+        states = session.viewer_states[:3]
+        if not states:
+            state = session.saved_view_state or self._default_state_for_session(session)
+            states = [state]
+
+        active_index = max(0, min(session.active_view_index, len(states) - 1))
+        self._clear_reader_views()
+
+        for state in states:
+            view = self._create_pdf_view()
+            self._add_reader_view(view)
+            self._show_session_in_view(view, session)
+            self._apply_view_state_to_view(view, state)
+
+        self.view = self.reader_views[active_index]
+        self._refresh_active_view_styles()
+        self._ensure_rendered_visible_pages(session, self.view)
+        session.saved_view_state = states[active_index]
+        session.current_page = states[active_index].page
+
+    def _create_action(self, text: str, shortcut: str, handler, shortcut_id: Optional[str] = None) -> QAction:
         action = QAction(text, self)
-        action.setShortcut(QKeySequence(shortcut))
+        active_shortcut = self._shortcut_for(shortcut_id, shortcut)
+        action.setShortcut(QKeySequence(active_shortcut) if active_shortcut else QKeySequence())
         action.triggered.connect(handler)
         self.addAction(action)
-        self._register_layout_independent_shortcut(action, shortcut)
+        if shortcut_id:
+            self._shortcut_actions[shortcut_id] = action
+        self._register_layout_independent_shortcut(action, active_shortcut)
         return action
 
+    def _shortcut_for(self, shortcut_id: Optional[str], default_shortcut: str) -> str:
+        if shortcut_id is None:
+            return default_shortcut
+        return self.shortcut_overrides.get(shortcut_id, default_shortcut)
+
+    def _current_shortcuts(self) -> Dict[str, str]:
+        return {
+            shortcut_id: self.shortcut_overrides.get(shortcut_id, default_shortcut)
+            for shortcut_id, default_shortcut in self._shortcut_defaults.items()
+        }
+
+    def _shortcut_definitions_for_dialog(self) -> List[Tuple[str, str, str]]:
+        return [
+            (shortcut_id, title, default_shortcut)
+            for shortcut_id, title, default_shortcut in SHORTCUT_DEFINITIONS
+            if shortcut_id in self._shortcut_actions
+        ]
+
+    def _apply_shortcut_overrides(self) -> None:
+        self._layout_independent_shortcuts.clear()
+        for shortcut_id, action in self._shortcut_actions.items():
+            default_shortcut = self._shortcut_defaults.get(shortcut_id, "")
+            shortcut = self.shortcut_overrides.get(shortcut_id, default_shortcut)
+            if shortcut_id == "toggle_last_documents" and shortcut_id not in self.shortcut_overrides:
+                action.setShortcuts([QKeySequence(value) for value in SHORTCUT_TOGGLE_LAST_DOCUMENTS])
+                for value in SHORTCUT_TOGGLE_LAST_DOCUMENTS:
+                    self._register_layout_independent_shortcut(action, value)
+                continue
+            elif shortcut:
+                action.setShortcut(QKeySequence(shortcut))
+            else:
+                action.setShortcut(QKeySequence())
+            self._register_layout_independent_shortcut(action, shortcut)
+
+    def _shortcut_conflict_message(self, shortcuts: Dict[str, str]) -> Optional[str]:
+        seen: Dict[str, str] = {}
+        labels = {shortcut_id: title for shortcut_id, title, _default in SHORTCUT_DEFINITIONS}
+        for shortcut_id, shortcut in shortcuts.items():
+            normalized = shortcut.strip().lower()
+            if not normalized:
+                continue
+            if normalized in seen:
+                return (
+                    f"{labels.get(shortcut_id, shortcut_id)} and "
+                    f"{labels.get(seen[normalized], seen[normalized])} both use {shortcut}."
+                )
+            seen[normalized] = shortcut_id
+        return None
+
     def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.MouseButtonPress:
+            view = self._view_for_event_object(obj)
+            if view is not None:
+                self._set_active_view(view, focus=True)
         if event.type() == QEvent.KeyPress and self._handle_layout_independent_shortcut(event):
             return True
         return super().eventFilter(obj, event)
@@ -540,7 +868,20 @@ class PdfReaderWindow(QMainWindow):
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(self.open_macro_settings)
         top_row.addWidget(settings_button)
+        shortcuts_button = QPushButton("Shortcuts")
+        shortcuts_button.clicked.connect(self.open_shortcut_settings)
+        top_row.addWidget(shortcuts_button)
+        self.google_drive_button = QPushButton()
+        self.google_drive_button.clicked.connect(self.toggle_google_drive_login)
+        top_row.addWidget(self.google_drive_button)
+        refresh_cloud_button = QPushButton("Refresh Cloud")
+        refresh_cloud_button.clicked.connect(self.refresh_cloud_documents)
+        top_row.addWidget(refresh_cloud_button)
+        upload_cloud_button = QPushButton("Upload Cloud")
+        upload_cloud_button.clicked.connect(self.upload_pdfs_to_cloud)
+        top_row.addWidget(upload_cloud_button)
         layout.addLayout(top_row)
+        self._update_google_drive_button()
 
         self.menu_search_input = QLineEdit()
         self.menu_search_input.setPlaceholderText("Search documents")
@@ -560,12 +901,90 @@ class PdfReaderWindow(QMainWindow):
     def show_menu(self) -> None:
         self._save_active_session_view()
         self._refresh_menu_documents()
+        if self.google_drive.is_logged_in and not self.cloud_documents:
+            self.refresh_cloud_documents(show_errors=False)
         self.central_stack.setCurrentIndex(1)
         self.menu_search_input.setFocus()
 
     def show_reader(self) -> None:
         self.central_stack.setCurrentIndex(0)
         self.view.setFocus()
+
+    def _view_state_for_view(self, view: PdfView) -> Optional[ViewState]:
+        session = self.current_session()
+        if session is None:
+            return None
+        visible_page = view.current_visible_page()
+        return ViewState(
+            page=visible_page or session.current_page,
+            scroll_x=view.horizontalScrollBar().value(),
+            scroll_y=view.verticalScrollBar().value(),
+            zoom=view.zoom_factor(),
+        )
+
+    def _apply_view_state_to_view(self, view: PdfView, state: ViewState) -> None:
+        view.set_zoom_factor(state.zoom)
+        view.horizontalScrollBar().setValue(state.scroll_x)
+        view.verticalScrollBar().setValue(state.scroll_y)
+        if view.current_visible_page() != state.page:
+            view.scroll_to_page(state.page)
+
+    def _show_session_in_view(self, view: PdfView, session: DocumentSession) -> None:
+        self._ensure_rendered_pages(session)
+        view.set_document_images(
+            session.rendered_pages,
+            preserve_zoom=True,
+            page_sizes=session.page_display_sizes,
+        )
+        view._pdf_reader_session_id = id(session)
+        view.set_comment_overlays(session.comments)
+        view.show_selection_lines(session.selection_lines)
+
+    def split_active_viewer(self) -> None:
+        session = self.current_session()
+        if session is None:
+            return
+        if len(self.reader_views) >= 3:
+            self.statusBar().showMessage("Already split into 3 viewers", 3000)
+            return
+
+        state = self._view_state_for_view(self.view) or self._default_state_for_session(session)
+        active_index = self.reader_splitter.indexOf(self._view_frames[self.view])
+        new_view = self._create_pdf_view()
+        self._add_reader_view(new_view, active_index + 1)
+        self._show_session_in_view(new_view, session)
+        self._apply_view_state_to_view(new_view, state)
+        self._set_active_view(new_view, focus=True)
+        self._ensure_rendered_visible_pages(session, new_view)
+        self._capture_session_view_layout(session)
+        self.statusBar().showMessage(f"Split into {len(self.reader_views)} viewers", 3000)
+
+    def close_active_viewer(self) -> None:
+        if len(self.reader_views) <= 1:
+            self.statusBar().showMessage("Cannot close the only viewer", 3000)
+            return
+
+        closing_view = self.view
+        closing_frame = self._view_frames[closing_view]
+        closing_index = self.reader_splitter.indexOf(closing_frame)
+        next_index = min(closing_index, len(self.reader_views) - 2)
+
+        self.reader_views.remove(closing_view)
+        self._view_frames.pop(closing_view, None)
+        closing_frame.setParent(None)
+        closing_frame.deleteLater()
+
+        next_view = self.reader_views[next_index]
+        self.view = next_view
+        self._refresh_active_view_styles()
+        self._sync_text_search_panel()
+        self._redraw_selection_lines()
+        self._update_status()
+        session = self.current_session()
+        if session is not None:
+            self._capture_session_view_layout(session)
+        next_view.setFocus()
+        self.statusBar().showMessage(f"Closed viewer; {len(self.reader_views)} remaining", 3000)
 
     def open_macro_settings(self) -> None:
         dialog = MacroSettingsDialog(self.equation_macros, self)
@@ -574,6 +993,156 @@ class PdfReaderWindow(QMainWindow):
         self.equation_macros = dialog.macros()
         self._save_session_state_now()
         self.statusBar().showMessage(f"Saved {len(self.equation_macros)} equation macro(s)", 5000)
+
+    def open_shortcut_settings(self) -> None:
+        dialog = ShortcutSettingsDialog(
+            self._shortcut_definitions_for_dialog(),
+            self._current_shortcuts(),
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        shortcuts = dialog.shortcuts()
+        conflict = self._shortcut_conflict_message(shortcuts)
+        if conflict:
+            QMessageBox.warning(self, "Shortcut conflict", conflict)
+            return
+
+        self.shortcut_overrides = {
+            shortcut_id: shortcut
+            for shortcut_id, shortcut in shortcuts.items()
+            if shortcut_id in self._shortcut_defaults
+            and shortcut != self._shortcut_defaults[shortcut_id]
+        }
+        self._apply_shortcut_overrides()
+        self._save_session_state_now()
+        self.statusBar().showMessage("Saved shortcuts", 5000)
+
+    def _update_google_drive_button(self) -> None:
+        if hasattr(self, "google_drive_button"):
+            self.google_drive_button.setText("Sign Out Drive" if self.google_drive.is_logged_in else "Sign In Drive")
+
+    def toggle_google_drive_login(self) -> None:
+        if self.google_drive.is_logged_in:
+            self.google_drive.sign_out()
+            self.cloud_documents = []
+            self._cloud_thumbnail_cache.clear()
+            self._update_google_drive_button()
+            self._refresh_menu_documents()
+            self.statusBar().showMessage("Signed out of Google Drive", 5000)
+            return
+
+        try:
+            self.google_drive.authenticate(
+                lambda url: QDesktopServices.openUrl(QUrl(url)),
+                QApplication.processEvents,
+            )
+            self._update_google_drive_button()
+            self.refresh_cloud_documents(show_errors=True)
+            self.statusBar().showMessage("Signed in to Google Drive", 5000)
+        except GoogleDriveError as exc:
+            QMessageBox.warning(self, "Google Drive", str(exc))
+        finally:
+            self._update_google_drive_button()
+
+    def refresh_cloud_documents(self, show_errors: bool = True) -> None:
+        if not self.google_drive.is_logged_in:
+            if show_errors:
+                QMessageBox.information(self, "Google Drive", "Sign in to Google Drive first.")
+            self._refresh_menu_documents()
+            return
+
+        try:
+            self.statusBar().showMessage(f"Loading Google Drive documents from {DRIVE_FOLDER_NAME}...", 0)
+            QApplication.processEvents()
+            self.cloud_documents = self.google_drive.list_documents(QApplication.processEvents)
+            self._refresh_menu_documents()
+            self.statusBar().showMessage(
+                f"Loaded {len(self.cloud_documents)} cloud document(s) from {DRIVE_FOLDER_NAME}",
+                5000,
+            )
+        except GoogleDriveError as exc:
+            if show_errors:
+                QMessageBox.warning(self, "Google Drive", str(exc))
+
+    def _cloud_document_thumbnail(self, document: CloudDocument) -> QPixmap:
+        if document.id in self._cloud_thumbnail_cache:
+            return self._cloud_thumbnail_cache[document.id]
+
+        placeholder = QPixmap(96, 128)
+        placeholder.fill(QColor("#eef5ff"))
+        painter = QPainter(placeholder)
+        painter.setPen(QPen(QColor("#3567a8")))
+        painter.drawRect(0, 0, 95, 127)
+        painter.drawText(placeholder.rect(), Qt.AlignCenter, "Drive")
+        painter.end()
+        self._cloud_thumbnail_cache[document.id] = placeholder
+        return placeholder
+
+    def _open_cloud_document(self, document: CloudDocument) -> None:
+        try:
+            cached_path = self.google_drive.cached_document_path(document)
+            if cached_path is not None:
+                self.statusBar().showMessage(f"Opening cached cloud document: {document.name}", 3000)
+                local_path = cached_path
+            else:
+                self.statusBar().showMessage(f"Downloading {document.name} from Google Drive...", 0)
+                QApplication.processEvents()
+                local_path = self.google_drive.download_document(document)
+        except GoogleDriveError as exc:
+            QMessageBox.warning(self, "Google Drive", str(exc))
+            return
+
+        self.load_pdf(str(local_path), switch_to=True)
+        self.show_reader()
+
+    def upload_pdfs_to_cloud(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Upload PDFs to Google Drive",
+            "",
+            "PDF Files (*.pdf)",
+        )
+        if not paths:
+            return
+        self.upload_paths_to_cloud(paths)
+
+    def upload_paths_to_cloud(self, paths: List[str]) -> None:
+        if not self.google_drive.is_logged_in:
+            QMessageBox.information(self, "Google Drive", "Sign in to Google Drive before uploading.")
+            return
+
+        uploaded: List[CloudDocument] = []
+        try:
+            for index, path in enumerate(paths, start=1):
+                self.statusBar().showMessage(
+                    f"Uploading {Path(path).name} to Google Drive ({index}/{len(paths)})...",
+                    0,
+                )
+                QApplication.processEvents()
+                uploaded.append(self.google_drive.upload_pdf(Path(path)))
+        except GoogleDriveError as exc:
+            QMessageBox.warning(self, "Google Drive", str(exc))
+            return
+
+        self.cloud_documents = uploaded + [
+            document
+            for document in self.cloud_documents
+            if document.id not in {uploaded_doc.id for uploaded_doc in uploaded}
+        ]
+        self.refresh_cloud_documents(show_errors=False)
+        self.statusBar().showMessage(f"Uploaded {len(uploaded)} PDF file(s) to Google Drive", 6000)
+
+    def _show_local_document_context_menu(self, button: QPushButton, pos: QPoint, path: str) -> None:
+        menu = QMenu(self)
+        open_action = menu.addAction("Open")
+        upload_action = menu.addAction("Upload to Cloud")
+        chosen = menu.exec(button.mapToGlobal(pos))
+        if chosen == open_action:
+            self._open_recent_document(path)
+        elif chosen == upload_action:
+            self.upload_paths_to_cloud([path])
 
     def create_new_document(self) -> None:
         dialog = DocumentBuilderDialog(self)
@@ -702,7 +1271,10 @@ class PdfReaderWindow(QMainWindow):
         query = self.menu_search_input.text().strip().lower() if hasattr(self, "menu_search_input") else ""
         self._clear_menu_documents()
 
-        shown = 0
+        local_shown = 0
+        local_title = QLabel("Local Documents")
+        local_title.setStyleSheet("font-size: 16px; font-weight: 600; margin-top: 6px;")
+        self.menu_list_layout.addWidget(local_title)
         for path in self.recent_documents:
             name = self._session_display_name(path)
             haystack = f"{name}\n{path}".lower()
@@ -715,11 +1287,53 @@ class PdfReaderWindow(QMainWindow):
             button.setMinimumHeight(146)
             button.setStyleSheet("QPushButton { text-align: left; padding: 10px; }")
             button.clicked.connect(lambda _checked=False, p=path: self._open_recent_document(p))
+            button.setContextMenuPolicy(Qt.CustomContextMenu)
+            button.customContextMenuRequested.connect(
+                lambda pos, b=button, p=path: self._show_local_document_context_menu(b, pos, p)
+            )
             self.menu_list_layout.addWidget(button)
-            shown += 1
+            local_shown += 1
 
-        if shown == 0:
-            empty = QLabel("No recent documents")
+        if local_shown == 0:
+            empty = QLabel("No local recent documents")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setMinimumHeight(140)
+            self.menu_list_layout.addWidget(empty)
+
+        cloud_title = QLabel("Cloud Documents")
+        cloud_title.setStyleSheet("font-size: 16px; font-weight: 600; margin-top: 12px;")
+        self.menu_list_layout.addWidget(cloud_title)
+
+        cloud_shown = 0
+        if self.google_drive.is_logged_in:
+            for document in self.cloud_documents:
+                name = document.name
+                detail = "Google Drive"
+                if document.modified_time:
+                    detail = f"Google Drive - modified {document.modified_time[:10]}"
+                haystack = f"{name}\n{detail}".lower()
+                if query and query not in haystack:
+                    continue
+
+                button = QPushButton(f"{name}\n{detail}")
+                button.setIcon(QIcon(self._cloud_document_thumbnail(document)))
+                button.setIconSize(QSize(96, 128))
+                button.setMinimumHeight(146)
+                button.setStyleSheet("QPushButton { text-align: left; padding: 10px; }")
+                button.clicked.connect(lambda _checked=False, doc=document: self._open_cloud_document(doc))
+                self.menu_list_layout.addWidget(button)
+                cloud_shown += 1
+
+        if cloud_shown == 0:
+            if self.google_drive.is_logged_in:
+                message = (
+                    f"No cloud documents in the {DRIVE_FOLDER_NAME} Drive folder"
+                    if not query
+                    else f"No matching cloud documents in {DRIVE_FOLDER_NAME}"
+                )
+            else:
+                message = "Sign in to Google Drive to show cloud documents"
+            empty = QLabel(message)
             empty.setAlignment(Qt.AlignCenter)
             empty.setMinimumHeight(140)
             self.menu_list_layout.addWidget(empty)
@@ -747,36 +1361,49 @@ class PdfReaderWindow(QMainWindow):
         self.show_reader()
 
     def _create_actions_and_toolbar(self) -> None:
-        self.menu_action = self._create_action("Menu", "Meta+M", self.show_menu)
-        self.open_many_action = self._create_action("Open PDFs", SHORTCUT_OPEN, self.open_multiple_pdfs)
+        self.menu_action = self._create_action("Menu", "Meta+M", self.show_menu, "menu")
+        self.open_many_action = self._create_action("Open PDFs", SHORTCUT_OPEN, self.open_multiple_pdfs, "open_pdfs")
         self.toggle_last_documents_action = QAction("Toggle Last Documents", self)
-        self.toggle_last_documents_action.setShortcuts(
-            [QKeySequence(shortcut) for shortcut in SHORTCUT_TOGGLE_LAST_DOCUMENTS]
-        )
+        toggle_last_shortcut = self._shortcut_for("toggle_last_documents", SHORTCUT_TOGGLE_LAST_DOCUMENTS[0])
+        if "toggle_last_documents" in self.shortcut_overrides:
+            self.toggle_last_documents_action.setShortcut(QKeySequence(toggle_last_shortcut) if toggle_last_shortcut else QKeySequence())
+        else:
+            self.toggle_last_documents_action.setShortcuts(
+                [QKeySequence(shortcut) for shortcut in SHORTCUT_TOGGLE_LAST_DOCUMENTS]
+            )
         self.toggle_last_documents_action.triggered.connect(self.toggle_last_documents)
         self.addAction(self.toggle_last_documents_action)
-        self.close_doc_action = self._create_action("Close Document", SHORTCUT_CLOSE_DOCUMENT, self.close_current_document)
-        self.back_action = self._create_action("Back", SHORTCUT_BACK, self.go_back)
-        self.forward_action = self._create_action("Forward", SHORTCUT_FORWARD, self.go_forward)
-        self.prev_action = self._create_action("Previous Page", SHORTCUT_PREVIOUS_PAGE, self.prev_page)
-        self.next_action = self._create_action("Next Page", SHORTCUT_NEXT_PAGE, self.next_page)
+        self._shortcut_actions["toggle_last_documents"] = self.toggle_last_documents_action
+        if "toggle_last_documents" in self.shortcut_overrides:
+            self._register_layout_independent_shortcut(self.toggle_last_documents_action, toggle_last_shortcut)
+        else:
+            for shortcut in SHORTCUT_TOGGLE_LAST_DOCUMENTS:
+                self._register_layout_independent_shortcut(self.toggle_last_documents_action, shortcut)
+        self.close_doc_action = self._create_action("Close Document", SHORTCUT_CLOSE_DOCUMENT, self.close_current_document, "close_document")
+        self.back_action = self._create_action("Back", SHORTCUT_BACK, self.go_back, "back")
+        self.forward_action = self._create_action("Forward", SHORTCUT_FORWARD, self.go_forward, "forward")
+        self.prev_action = self._create_action("Previous Page", SHORTCUT_PREVIOUS_PAGE, self.prev_page, "previous_page")
+        self.next_action = self._create_action("Next Page", SHORTCUT_NEXT_PAGE, self.next_page, "next_page")
         self.zoom_in_action = self._create_action(
             "Zoom In",
             SHORTCUT_ZOOM_IN,
             lambda: self.view.set_zoom_factor(self.view.zoom_factor() * 1.2),
+            "zoom_in",
         )
         self.zoom_out_action = self._create_action(
             "Zoom Out",
             SHORTCUT_ZOOM_OUT,
             lambda: self.view.set_zoom_factor(self.view.zoom_factor() / 1.2),
+            "zoom_out",
         )
-        self.jump_action = self._create_action("Jump to Equation", SHORTCUT_JUMP_TO_EQUATION, self.jump_to_equation)
-        self.toggle_bookmarks_action = self._create_action("Toggle Bookmarks", SHORTCUT_TOGGLE_BOOKMARKS, self.toggle_bookmarks_panel)
-        self.add_bookmark_action = self._create_action("Add Bookmark", SHORTCUT_ADD_BOOKMARK, self.add_bookmark)
+        self.jump_action = self._create_action("Jump to Equation", SHORTCUT_JUMP_TO_EQUATION, self.jump_to_equation, "jump_to_equation")
+        self.toggle_bookmarks_action = self._create_action("Toggle Bookmarks", SHORTCUT_TOGGLE_BOOKMARKS, self.toggle_bookmarks_panel, "toggle_bookmarks")
+        self.add_bookmark_action = self._create_action("Add Bookmark", SHORTCUT_ADD_BOOKMARK, self.add_bookmark, "add_bookmark")
         self.return_to_equation_source_action = self._create_action(
             "Return to Equation Source",
             SHORTCUT_RETURN_TO_EQUATION_SOURCE,
             self.return_to_equation_source_page,
+            "return_to_equation_source",
         )
         self.reload_a_txt_action = QAction("Reload a.txt", self)
         self.reload_a_txt_action.triggered.connect(self._reload_current_session_chapter_starts)
@@ -784,46 +1411,67 @@ class PdfReaderWindow(QMainWindow):
             "Copy Between Blue Lines",
             SHORTCUT_COPY_BETWEEN_LINES,
             self.copy_between_selection_lines,
+            "copy_between_lines",
         )
         self.clear_selection_lines_action = self._create_action(
             "Clear Blue Lines",
             SHORTCUT_CLEAR_SELECTION_LINES,
             self.clear_selection_lines,
+            "clear_selection_lines",
         )
         self.preview_equation_action = self._create_action(
             "Preview Equation Under Cursor",
             SHORTCUT_PREVIEW_EQUATION,
             self.preview_equation_under_cursor,
+            "preview_equation",
         )
         self.open_text_search_action = self._create_action(
             "Search Text",
             SHORTCUT_OPEN_TEXT_SEARCH,
             self.open_text_search,
+            "open_text_search",
+        )
+        self.split_viewer_action = self._create_action(
+            "Split Viewer",
+            SHORTCUT_SPLIT_VIEWER,
+            self.split_active_viewer,
+            "split_viewer",
+        )
+        self.close_viewer_action = self._create_action(
+            "Close Viewer",
+            SHORTCUT_CLOSE_VIEWER,
+            self.close_active_viewer,
+            "close_viewer",
         )
         self.return_to_text_search_source_action = self._create_action(
             "Return to Text Search Source",
             SHORTCUT_RETURN_TO_TEXT_SEARCH_SOURCE,
             self.return_to_text_search_source,
+            "return_to_text_search_source",
         )
         self.scan_equation_index_action = self._create_action(
             "Scan Equation Index",
             SHORTCUT_SCAN_EQUATION_INDEX,
             self.choose_equation_index_scan_mode,
+            "scan_equation_index",
         )
         self.learn_equation_rectangle_action = self._create_action(
             "Learn Equation Rectangle",
             SHORTCUT_LEARN_EQUATION_RECTANGLE,
             self.learn_equation_format_from_selected_rectangle,
+            "learn_equation_rectangle",
         )
         self.create_comment_action = self._create_action(
             "Create Comment",
             SHORTCUT_CREATE_COMMENT,
             self.create_comment_from_selected_rectangle,
+            "create_comment",
         )
         self.toggle_equation_lookup_action = self._create_action(
             "Toggle Equation Lookup",
             SHORTCUT_TOGGLE_EQUATION_LOOKUP,
             self.toggle_equation_lookup_mode,
+            "toggle_equation_lookup",
         )
 
         toolbar = QToolBar("Main")
@@ -892,7 +1540,25 @@ class PdfReaderWindow(QMainWindow):
             self._switch_to_document(target_index)
 
     def _session_display_name(self, path: str) -> str:
+        cloud_name = self._cloud_cache_display_name(path)
+        if cloud_name:
+            return cloud_name
         return Path(path).name
+
+    @staticmethod
+    def _cloud_cache_display_name(path: str) -> str:
+        file_path = Path(path)
+        meta_path = file_path.with_suffix(file_path.suffix + ".json")
+        if not meta_path.exists():
+            return ""
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        name = str(data.get("name") or "").strip()
+        return name
 
     def _set_no_document_ui(self) -> None:
         self.current_index = -1
@@ -901,8 +1567,9 @@ class PdfReaderWindow(QMainWindow):
         self.page_input.setMaximum(1)
         self.page_input.setValue(1)
         self.page_input.blockSignals(False)
-        self.view.clear_page()
-        self._view_session_id = None
+        self._clear_reader_views()
+        self.view = self._create_pdf_view()
+        self._add_reader_view(self.view)
         self.status_label.setText("No PDF loaded")
         self.zoom_label.setText("100%")
         self.bookmarks_tree.clear()
@@ -956,8 +1623,9 @@ class PdfReaderWindow(QMainWindow):
         pixmap = self._render_page(session, page_number)
         session.rendered_pages[page_number - 1] = pixmap
         session.rendered_page_numbers.add(page_number)
-        if self._view_has_session(session):
-            self.view.update_page_image(page_number, pixmap)
+        for view in self.reader_views:
+            if self._view_has_session(session, view):
+                view.update_page_image(page_number, pixmap)
 
     def _ensure_rendered_window(self, session: DocumentSession, center_page: int) -> None:
         start = max(1, center_page - LAZY_RENDER_RADIUS)
@@ -965,8 +1633,31 @@ class PdfReaderWindow(QMainWindow):
         for page_number in range(start, end + 1):
             self._ensure_rendered_page(session, page_number)
 
-    def _view_has_session(self, session: DocumentSession) -> bool:
-        return getattr(self, "_view_session_id", None) == id(session)
+    def _ensure_rendered_visible_pages(self, session: DocumentSession, view: Optional[PdfView] = None) -> None:
+        target_view = view or self.view
+        visible_pages = target_view.visible_pages()
+        if not visible_pages:
+            visible_page = target_view.current_visible_page()
+            if visible_page is None:
+                return
+            visible_pages = [visible_page]
+
+        pages_to_render: List[int] = []
+        seen = set()
+        for visible_page in visible_pages:
+            start = max(1, visible_page - LAZY_RENDER_RADIUS)
+            end = min(len(session.doc), visible_page + LAZY_RENDER_RADIUS)
+            for page_number in range(start, end + 1):
+                if page_number not in seen:
+                    pages_to_render.append(page_number)
+                    seen.add(page_number)
+
+        for page_number in pages_to_render:
+            self._ensure_rendered_page(session, page_number)
+
+    def _view_has_session(self, session: DocumentSession, view: Optional[PdfView] = None) -> bool:
+        target_view = view or self.view
+        return getattr(target_view, "_pdf_reader_session_id", None) == id(session)
 
     def _reader_view_is_active(self) -> bool:
         return not hasattr(self, "central_stack") or self.central_stack.currentIndex() == 0
@@ -989,7 +1680,7 @@ class PdfReaderWindow(QMainWindow):
         session = self.current_session()
         if session is None or not self._reader_view_is_active() or not self._view_has_session(session):
             return
-        session.saved_view_state = self._current_view_state()
+        self._capture_session_view_layout(session)
 
     def _restore_view_state(self, session: DocumentSession, state: ViewState) -> None:
         self._show_page_for_session(session, state.page, push_history=False)
@@ -1030,16 +1721,14 @@ class PdfReaderWindow(QMainWindow):
             was_switching = self._switching_docs
             self._switching_docs = True
             try:
-                if not self._view_has_session(session):
-                    self.view.set_document_images(
-                        session.rendered_pages,
-                        preserve_zoom=True,
-                        page_sizes=session.page_display_sizes,
-                    )
-                    self._view_session_id = id(session)
-                    self.view.set_comment_overlays(session.comments)
-                    self._ensure_rendered_window(session, page_number)
+                for view in self.reader_views:
+                    if not self._view_has_session(session, view):
+                        self._show_session_in_view(view, session)
+                        if view is not self.view:
+                            view.scroll_to_page(page_number)
+                self._ensure_rendered_window(session, page_number)
                 self.view.scroll_to_page(page_number)
+                self._ensure_rendered_visible_pages(session, self.view)
             finally:
                 self._switching_docs = was_switching
             self._redraw_selection_lines()
@@ -1248,16 +1937,22 @@ class PdfReaderWindow(QMainWindow):
             self.status_label.setText("No PDF loaded")
             self.zoom_label.setText("100%")
             return
-        visible_page = self.view.current_visible_page()
-        if visible_page is not None and visible_page != session.current_page:
+        sender = self.sender()
+        changed_view = sender if isinstance(sender, PdfView) else self.view
+        if not self._view_has_session(session, changed_view):
+            return
+
+        visible_page = changed_view.current_visible_page()
+        self._ensure_rendered_visible_pages(session, changed_view)
+        if changed_view is self.view and visible_page is not None and visible_page != session.current_page:
             session.current_page = visible_page
-            self._ensure_rendered_window(session, visible_page)
             self.page_input.blockSignals(True)
             self.page_input.setValue(visible_page)
             self.page_input.blockSignals(False)
-        if not self._switching_docs:
+        if changed_view is self.view and not self._switching_docs:
             self._save_active_session_view()
-        self._update_status()
+        if changed_view is self.view:
+            self._update_status()
 
     def _remember_equation_source_page(self) -> None:
         session = self.current_session()
@@ -1359,6 +2054,8 @@ class PdfReaderWindow(QMainWindow):
         restored_state: Optional[ViewState] = None,
         restored_back: Optional[List[ViewState]] = None,
         restored_forward: Optional[List[ViewState]] = None,
+        restored_viewer_states: Optional[List[ViewState]] = None,
+        restored_active_view_index: int = 0,
         restored_user_bookmarks: Optional[List[UserBookmark]] = None,
         restored_selection_lines: Optional[List[SelectionLine]] = None,
         restored_comments: Optional[List[PdfComment]] = None,
@@ -1408,6 +2105,8 @@ class PdfReaderWindow(QMainWindow):
             history_back=restored_back[:] if restored_back else [],
             history_forward=restored_forward[:] if restored_forward else [],
             saved_view_state=restored_state,
+            viewer_states=restored_viewer_states[:3] if restored_viewer_states else [],
+            active_view_index=max(0, min(restored_active_view_index, 2)),
             chapter_starts=chapter_starts,
             chapter_starts_source=chapter_starts_source,
             user_bookmarks=restored_user_bookmarks[:] if restored_user_bookmarks else [],
@@ -1439,6 +2138,11 @@ class PdfReaderWindow(QMainWindow):
 
         if restored_state is not None:
             session.current_page = restored_state.page
+            if not session.viewer_states:
+                session.viewer_states = [restored_state]
+                session.active_view_index = 0
+        elif not session.viewer_states:
+            session.viewer_states = [self._default_state_for_session(session)]
 
         if session.equation_index and session.equation_index_signature is not None:
             current_signature = self._document_signature(session)
@@ -1550,8 +2254,10 @@ class PdfReaderWindow(QMainWindow):
             self.search_input.setText(session.text_search_query)
             self.search_input.blockSignals(False)
 
-            state = session.saved_view_state or self._default_state_for_session(session)
-            self._restore_view_state(session, state)
+            self._rebuild_reader_views_for_session(session)
+            self.page_input.blockSignals(True)
+            self.page_input.setValue(session.current_page)
+            self.page_input.blockSignals(False)
             self._remember_document_activation(session)
         finally:
             self._switching_docs = False
@@ -4412,6 +5118,19 @@ do {
             zoom=float(data.get("zoom", 1.0)),
         )
 
+    @classmethod
+    def _deserialize_view_states(cls, entries: object) -> List[ViewState]:
+        if not isinstance(entries, list):
+            return []
+        out: List[ViewState] = []
+        for entry in entries[:3]:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                out.append(cls._deserialize_view_state(entry))
+            except Exception:
+                continue
+        return out
 
     @staticmethod
     def _serialize_selection_lines(lines: List[SelectionLine]) -> List[dict]:
@@ -4591,10 +5310,14 @@ do {
 
     def _session_persistence_entry(self, session: DocumentSession) -> dict:
         state = session.saved_view_state or self._default_state_for_session(session)
+        viewer_states = session.viewer_states or [state]
+        active_view_index = max(0, min(session.active_view_index, len(viewer_states) - 1))
         return {
             "path": session.path,
             "file_identity": self._pdf_identity_for_path(session.path) or {},
             "view_state": self._serialize_view_state(state),
+            "viewer_states": [self._serialize_view_state(v) for v in viewer_states[:3]],
+            "active_view_index": active_view_index,
             "history_back": [self._serialize_view_state(v) for v in session.history_back],
             "history_forward": [self._serialize_view_state(v) for v in session.history_forward],
             "user_bookmarks": self._serialize_user_bookmarks(session.user_bookmarks),
@@ -4644,6 +5367,7 @@ do {
             documents=docs_data,
             recent_documents=recent_entries,
             equation_macros=dict(self.equation_macros),
+            shortcut_overrides=dict(self.shortcut_overrides),
         )
 
     def _load_pdf_from_persistence_entry(
@@ -4669,6 +5393,13 @@ do {
 
         try:
             restored_state = self._deserialize_view_state(doc_entry.get("view_state", {}))
+            restored_viewer_states = self._deserialize_view_states(doc_entry.get("viewer_states", []))
+            if not restored_viewer_states:
+                restored_viewer_states = [restored_state]
+            try:
+                restored_active_view_index = max(0, int(doc_entry.get("active_view_index", 0)))
+            except Exception:
+                restored_active_view_index = 0
             restored_back = [
                 self._deserialize_view_state(v)
                 for v in doc_entry.get("history_back", [])
@@ -4729,6 +5460,8 @@ do {
             restored_equation_index_signature = raw_signature if isinstance(raw_signature, dict) else None
         except Exception:
             restored_state = ViewState(page=1, scroll_x=0, scroll_y=0, zoom=1.0)
+            restored_viewer_states = [restored_state]
+            restored_active_view_index = 0
             restored_back = []
             restored_forward = []
             restored_user_bookmarks = []
@@ -4751,6 +5484,8 @@ do {
             restored_state=restored_state,
             restored_back=restored_back,
             restored_forward=restored_forward,
+            restored_viewer_states=restored_viewer_states,
+            restored_active_view_index=restored_active_view_index,
             restored_user_bookmarks=restored_user_bookmarks,
             restored_selection_lines=restored_selection_lines,
             restored_comments=restored_comments,
@@ -4790,6 +5525,13 @@ do {
 
                 try:
                     restored_state = self._deserialize_view_state(doc_entry.get("view_state", {}))
+                    restored_viewer_states = self._deserialize_view_states(doc_entry.get("viewer_states", []))
+                    if not restored_viewer_states:
+                        restored_viewer_states = [restored_state]
+                    try:
+                        restored_active_view_index = max(0, int(doc_entry.get("active_view_index", 0)))
+                    except Exception:
+                        restored_active_view_index = 0
                     restored_back = [
                         self._deserialize_view_state(v)
                         for v in doc_entry.get("history_back", [])
@@ -4850,6 +5592,8 @@ do {
                     restored_equation_index_signature = raw_signature if isinstance(raw_signature, dict) else None
                 except Exception:
                     restored_state = ViewState(page=1, scroll_x=0, scroll_y=0, zoom=1.0)
+                    restored_viewer_states = [restored_state]
+                    restored_active_view_index = 0
                     restored_back = []
                     restored_forward = []
                     restored_user_bookmarks = []
@@ -4872,6 +5616,8 @@ do {
                     restored_state=restored_state,
                     restored_back=restored_back,
                     restored_forward=restored_forward,
+                    restored_viewer_states=restored_viewer_states,
+                    restored_active_view_index=restored_active_view_index,
                     restored_user_bookmarks=restored_user_bookmarks,
                     restored_selection_lines=restored_selection_lines,
                     restored_comments=restored_comments,

@@ -64,6 +64,7 @@ class SessionPersistence:
     documents: List[dict] = field(default_factory=list)
     recent_documents: List[object] = field(default_factory=list)
     equation_macros: Dict[str, str] = field(default_factory=dict)
+    shortcut_overrides: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -81,6 +82,8 @@ class DocumentSession:
     history_back: List[ViewState] = field(default_factory=list)
     history_forward: List[ViewState] = field(default_factory=list)
     saved_view_state: Optional[ViewState] = None
+    viewer_states: List[ViewState] = field(default_factory=list)
+    active_view_index: int = 0
     chapter_starts: Optional[Dict[int, int]] = None
     chapter_starts_source: Optional[str] = None
     section_starts: Dict[Tuple[int, ...], int] = field(default_factory=dict)
