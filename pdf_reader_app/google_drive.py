@@ -423,6 +423,11 @@ class GoogleDriveClient:
                 token = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 400 and "client_secret is missing" in detail:
+                raise GoogleDriveError(
+                    "This Google OAuth client requires a client secret. Add google_oauth_client.json "
+                    "next to the app on this computer, or set PDF_READER_GOOGLE_CLIENT_SECRET."
+                ) from exc
             raise GoogleDriveError(f"Google OAuth token exchange failed ({exc.code}): {detail}") from exc
         except urllib.error.URLError as exc:
             raise GoogleDriveError(f"Could not reach Google OAuth: {exc.reason}") from exc
