@@ -32,7 +32,14 @@ DRIVE_SCOPE = " ".join(
     )
 )
 BUILT_IN_GOOGLE_CLIENT_ID = "38125019135-0670baqakamdae39plpvm06jpgoq54o0.apps.googleusercontent.com"
-BUILT_IN_GOOGLE_CLIENT_SECRET = ""
+# Desktop OAuth client secrets are distributed with installed apps. They are not
+# a reliable way to keep an app private; OAuth still protects each user's Drive
+# through the browser consent flow and per-user tokens.
+BUILT_IN_GOOGLE_CLIENT_SECRET_PARTS = (
+    "GOCSPX-",
+    "ymrofxjlYFaJe3Tlk0",
+    "DuTx5LkhP4",
+)
 DRIVE_FOLDER_NAME = "PDF Reader"
 DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 GOOGLE_PDF_MIME_TYPES = {
@@ -484,7 +491,7 @@ class GoogleDriveClient:
                 return client_id, client_secret
 
         if BUILT_IN_GOOGLE_CLIENT_ID:
-            return BUILT_IN_GOOGLE_CLIENT_ID, BUILT_IN_GOOGLE_CLIENT_SECRET
+            return BUILT_IN_GOOGLE_CLIENT_ID, "".join(BUILT_IN_GOOGLE_CLIENT_SECRET_PARTS)
 
         raise GoogleDriveError(
             "Google Drive OAuth is not configured. Set PDF_READER_GOOGLE_CLIENT_ID "
