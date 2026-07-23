@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, QTimer, QPoint, QUrl, QBuffer, QIODevice, QEvent,
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QCursor, QDesktopServices, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
+    QColorDialog,
     QDialog,
     QDialogButtonBox,
     QDockWidget,
@@ -50,6 +51,10 @@ from .google_drive import DRIVE_FOLDER_NAME, CloudDocument, GoogleDriveClient, G
 from .models import *
 from .session import *
 from .widgets import *
+
+BOOKMARKS_DOCK_MIN_WIDTH = 220
+BOOKMARKS_DOCK_DEFAULT_WIDTH = 320
+READER_PANE_MIN_HEIGHT = 24
 
 class ShortcutSettingsDialog(QDialog):
     def __init__(
@@ -193,6 +198,7 @@ class PdfReaderWindow(QMainWindow):
         self.sessions: List[DocumentSession] = []
         self.current_index: int = -1
         self._suspend_history = False
+        self._suspend_view_updates = False
         self._switching_docs = False
         self.recent_documents: List[str] = []
         self.recent_document_entries: Dict[str, dict] = {}
@@ -254,7 +260,9 @@ class PdfReaderWindow(QMainWindow):
             }
 
         self.reader_splitter = QSplitter(Qt.Vertical)
-        self.reader_splitter.setChildrenCollapsible(False)
+        self.reader_splitter.setChildrenCollapsible(True)
+        self.reader_splitter.setMinimumWidth(0)
+        self.reader_splitter.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.reader_views: List[PdfView] = []
         self._view_frames: Dict[PdfView, QFrame] = {}
         self.view = self._create_pdf_view()
@@ -300,11 +308,15 @@ class PdfReaderWindow(QMainWindow):
 
         self.bookmarks_tree = QTreeWidget()
         self.bookmarks_tree.setHeaderHidden(True)
+        self.bookmarks_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.bookmarks_tree.itemActivated.connect(self._bookmark_item_activated)
         self.bookmarks_tree.itemClicked.connect(self._bookmark_item_activated)
 
         self.bookmarks_dock = QDockWidget("Bookmarks", self)
         self.bookmarks_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+        self.bookmarks_dock.setMinimumWidth(BOOKMARKS_DOCK_MIN_WIDTH)
+        self.bookmarks_dock.setMaximumWidth(16777215)
+        self.bookmarks_dock.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.bookmarks_dock.setWidget(self.bookmarks_tree)
         self.addDockWidget(Qt.RightDockWidgetArea, self.bookmarks_dock)
         self.bookmarks_dock.hide()
@@ -350,6 +362,8 @@ class PdfReaderWindow(QMainWindow):
         QApplication.instance().installEventFilter(self)
 
         reader_page = QWidget()
+        reader_page.setMinimumWidth(0)
+        reader_page.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         layout = QVBoxLayout(reader_page)
         layout.addWidget(self.doc_tabs)
         layout.addWidget(self.reader_splitter)
@@ -361,6 +375,8 @@ class PdfReaderWindow(QMainWindow):
         layout.addLayout(bottom)
 
         self.central_stack = QStackedWidget()
+        self.central_stack.setMinimumWidth(0)
+        self.central_stack.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.central_stack.addWidget(reader_page)
         self.central_stack.addWidget(self._create_menu_page())
         self.setCentralWidget(self.central_stack)
@@ -372,21 +388,29 @@ class PdfReaderWindow(QMainWindow):
 
     def _create_pdf_view(self) -> PdfView:
         view = PdfView()
+        view.setMinimumSize(0, READER_PANE_MIN_HEIGHT)
+        view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         view.view_changed.connect(self._on_view_changed)
         view.clicked.connect(lambda page, x, y, v=view: self._activate_and_call(v, self.jump_if_reference_clicked, page, x, y))
         view.right_clicked.connect(lambda page, x, y, v=view: self._activate_and_call(v, self.research_equation_reference_clicked, page, x, y))
         view.link_click_requested.connect(lambda page, x, y, v=view: self._activate_and_call(v, self.open_link_clicked, page, x, y))
         view.selection_line_requested.connect(lambda page, x, y, v=view: self._activate_and_call(v, self.add_selection_line_at_position, page, x, y))
+        view.selection_context_menu_requested.connect(lambda pos, v=view: self._activate_and_call(v, self.show_selected_rectangle_context_menu, pos))
         view.pdf_files_dropped.connect(lambda paths, v=view: self._activate_and_call(v, self.open_dropped_pdfs, paths))
         view.hover_moved.connect(lambda page, x, y, pos, v=view: self._schedule_equation_preview(page, x, y, pos) if v is self.view else None)
         view.hover_left.connect(self._hide_equation_preview)
         view.comment_clicked.connect(lambda index, v=view: self._activate_and_call(v, self.open_comment_at_index, index))
+        view.comment_context_menu_requested.connect(
+            lambda index, pos, v=view: self._activate_and_call(v, self.show_comment_context_menu, index, pos)
+        )
         view._pdf_reader_session_id = None
         return view
 
     def _add_reader_view(self, view: PdfView, index: Optional[int] = None) -> None:
         frame = QFrame()
         frame.setObjectName("readerPaneFrame")
+        frame.setMinimumSize(0, READER_PANE_MIN_HEIGHT)
+        frame.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         frame_layout = QVBoxLayout(frame)
         frame_layout.setContentsMargins(2, 2, 2, 2)
         frame_layout.setSpacing(0)
@@ -556,13 +580,64 @@ class PdfReaderWindow(QMainWindow):
         return None
 
     def eventFilter(self, obj, event) -> bool:
+        if event.type() in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop):
+            if self._handle_window_pdf_drop_event(obj, event):
+                return True
         if event.type() == QEvent.MouseButtonPress:
             view = self._view_for_event_object(obj)
             if view is not None:
                 self._set_active_view(view, focus=True)
+        if event.type() == QEvent.KeyPress and self._handle_document_tab_shortcut(event):
+            return True
         if event.type() == QEvent.KeyPress and self._handle_layout_independent_shortcut(event):
             return True
         return super().eventFilter(obj, event)
+
+    def _handle_window_pdf_drop_event(self, obj, event) -> bool:
+        if QApplication.activeModalWidget() is not None:
+            return False
+        if not isinstance(obj, QWidget):
+            return False
+        if obj is not self and not self.isAncestorOf(obj):
+            return False
+
+        paths = pdf_paths_from_mime_data(event.mimeData())
+        if not paths:
+            return False
+
+        if event.type() in (QEvent.DragEnter, QEvent.DragMove):
+            event.acceptProposedAction()
+            return True
+        if event.type() == QEvent.Drop:
+            event.acceptProposedAction()
+            self.open_dropped_pdfs(paths)
+            return True
+        return False
+
+    def _handle_document_tab_shortcut(self, event) -> bool:
+        if QApplication.activeWindow() is not self or len(self.sessions) < 2:
+            return False
+        if event.key() not in (Qt.Key_Tab, Qt.Key_Backtab):
+            return False
+
+        relevant_modifiers = (
+            Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
+        )
+        event_modifiers = event.modifiers() & relevant_modifiers
+        if event.key() == Qt.Key_Backtab:
+            if event_modifiers != Qt.ShiftModifier:
+                return False
+            direction = -1
+        elif event_modifiers == Qt.NoModifier:
+            direction = 1
+        elif event_modifiers == Qt.ShiftModifier:
+            direction = -1
+        else:
+            return False
+
+        self.switch_to_adjacent_document(direction)
+        event.accept()
+        return True
 
     def _register_layout_independent_shortcut(self, action: QAction, shortcut: str) -> None:
         if shortcut.endswith("++"):
@@ -789,6 +864,12 @@ class PdfReaderWindow(QMainWindow):
             self.recent_document_entries.pop(old_key, None)
 
     @staticmethod
+    def _strip_comment_metadata(entry: dict) -> dict:
+        clean = dict(entry)
+        clean.pop("comments", None)
+        return clean
+
+    @staticmethod
     def _recent_documents_from_session_data(session_data: Optional[SessionPersistence]) -> Tuple[List[str], Dict[str, dict]]:
         if session_data is None:
             return [], {}
@@ -804,14 +885,14 @@ class PdfReaderWindow(QMainWindow):
             raw_path = recent_entry.get("path")
             if isinstance(raw_path, str) and raw_path:
                 paths.append(raw_path)
-                entries[PdfReaderWindow._path_key(raw_path)] = dict(recent_entry)
+                entries[PdfReaderWindow._path_key(raw_path)] = PdfReaderWindow._strip_comment_metadata(recent_entry)
         for doc_entry in session_data.documents:
             if not isinstance(doc_entry, dict):
                 continue
             raw_path = doc_entry.get("path")
             if isinstance(raw_path, str) and raw_path:
                 paths.append(raw_path)
-                entries[PdfReaderWindow._path_key(raw_path)] = dict(doc_entry)
+                entries[PdfReaderWindow._path_key(raw_path)] = PdfReaderWindow._strip_comment_metadata(doc_entry)
 
         out: List[str] = []
         seen = set()
@@ -937,7 +1018,8 @@ class PdfReaderWindow(QMainWindow):
             page_sizes=session.page_display_sizes,
         )
         view._pdf_reader_session_id = id(session)
-        view.set_comment_overlays(session.comments)
+        view.set_cover_overlays(session.covers)
+        view.set_comment_overlays(self._display_comments_for_session(session), visible_count=len(session.comments))
         view.show_selection_lines(session.selection_lines)
 
     def split_active_viewer(self) -> None:
@@ -958,6 +1040,33 @@ class PdfReaderWindow(QMainWindow):
         self._ensure_rendered_visible_pages(session, new_view)
         self._capture_session_view_layout(session)
         self.statusBar().showMessage(f"Split into {len(self.reader_views)} viewers", 3000)
+
+    def rotate_viewer_segments(self) -> None:
+        session = self.current_session()
+        if session is None:
+            return
+
+        views = [view for view in self.reader_views if self._view_has_session(session, view)]
+        if len(views) < 2:
+            self.statusBar().showMessage("Split the viewer first to rotate segments", 3000)
+            return
+
+        states = [self._view_state_for_view(view) for view in views]
+        if any(state is None for state in states):
+            return
+
+        rotated_states = states[1:] + states[:1]
+        self._suspend_view_updates = True
+        try:
+            for view, state in zip(views, rotated_states):
+                self._apply_view_state_to_view(view, state)
+                self._ensure_rendered_visible_pages(session, view)
+        finally:
+            self._suspend_view_updates = False
+
+        self._capture_session_view_layout(session)
+        self._update_status()
+        self.statusBar().showMessage(f"Rotated {len(views)} viewer segments", 3000)
 
     def close_active_viewer(self) -> None:
         if len(self.reader_views) <= 1:
@@ -1158,12 +1267,216 @@ class PdfReaderWindow(QMainWindow):
             self.close_document_at_index(existing_index)
         self.load_pdf(path, switch_to=True)
 
+    def _selected_rectangle_pdf_rect(self) -> Optional[Tuple[int, Tuple[float, float, float, float]]]:
+        selected = self.view.selected_learning_rect()
+        if selected is None:
+            return None
+        page, x0, y0, x1, y1 = selected
+        rect = (
+            min(x0, x1) / RENDER_SCALE,
+            min(y0, y1) / RENDER_SCALE,
+            max(x0, x1) / RENDER_SCALE,
+            max(y0, y1) / RENDER_SCALE,
+        )
+        return page, rect
+
+    def _refresh_annotation_overlays(self, session: DocumentSession) -> None:
+        comments = self._display_comments_for_session(session)
+        for view in self.reader_views:
+            if self._view_has_session(session, view):
+                view.set_cover_overlays(session.covers)
+                view.set_comment_overlays(comments, visible_count=len(session.comments))
+
+    def _visible_saved_comment_indices(self, session: DocumentSession) -> List[int]:
+        return [
+            index
+            for index in range(len(session.saved_pdf_comments))
+            if index not in session.saved_comment_removals
+        ]
+
+    def _display_comments_for_session(self, session: DocumentSession) -> List[PdfComment]:
+        saved_comments = [
+            session.saved_comment_edits.get(index, session.saved_pdf_comments[index])
+            for index in self._visible_saved_comment_indices(session)
+        ]
+        return session.comments + saved_comments
+
+    def _comment_source_for_display_index(self, session: DocumentSession, index: int) -> Optional[Tuple[str, int]]:
+        if index < 0:
+            return None
+        if index < len(session.comments):
+            return "pending", index
+        saved_position = index - len(session.comments)
+        visible_saved = self._visible_saved_comment_indices(session)
+        if not (0 <= saved_position < len(visible_saved)):
+            return None
+        return "saved", visible_saved[saved_position]
+
+    def _repair_pdf_in_place_for_append(self, session: DocumentSession) -> bool:
+        if session.doc.can_save_incrementally():
+            return True
+
+        source_path = Path(session.path)
+        tmp_path: Optional[Path] = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{source_path.stem}.repair-",
+                suffix=source_path.suffix,
+                dir=str(source_path.parent),
+                delete=False,
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+
+            session.doc.save(str(tmp_path), garbage=4, deflate=True)
+            session.doc.close()
+            tmp_path.replace(source_path)
+            session.doc = fitz.open(session.path)
+            if not session.doc.can_save_incrementally():
+                raise RuntimeError("The repaired PDF still cannot accept appended incremental updates.")
+            session.saved_pdf_comments = self._load_pdf_reader_comments_from_pdf(session.doc)
+            session.rendered_pages = []
+            session.rendered_page_numbers.clear()
+            session.page_display_sizes = []
+            self._ensure_rendered_pages(session)
+            index = self.sessions.index(session)
+            self.doc_tabs.setTabText(index, self._session_display_name(session.path))
+            self.doc_tabs.setTabToolTip(index, session.path)
+            self._refresh_annotation_overlays(session)
+            for view in self.reader_views:
+                if not self._view_has_session(session, view):
+                    continue
+                state = self._view_state_for_view(view)
+                self._show_session_in_view(view, session)
+                if state is not None:
+                    self._apply_view_state_to_view(view, state)
+            self._remember_recent_document(session.path, save=False)
+            self.statusBar().showMessage("Repaired PDF structure; saving comments by appended update...", 7000)
+            return True
+        except Exception as exc:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            try:
+                if session.doc.is_closed:
+                    session.doc = fitz.open(session.path)
+            except Exception:
+                pass
+            QMessageBox.warning(self, "Repair PDF", f"Could not repair the PDF for appended comments:\n{exc}")
+            self.view.setFocus()
+            return False
+
+    def show_selected_rectangle_context_menu(self, global_pos: QPoint) -> None:
+        session = self.current_session()
+        selected = self._selected_rectangle_pdf_rect()
+        if session is None or selected is None:
+            return
+
+        menu = QMenu(self)
+        comment_action = menu.addAction("Add Comment")
+        learn_action = menu.addAction("Learn Equation Rectangle")
+        copy_text_action = menu.addAction("Copy Text in Box")
+        menu.addSeparator()
+
+        cover_menu = menu.addMenu("Cover with Color")
+        cover_white_action = cover_menu.addAction("White")
+        cover_black_action = cover_menu.addAction("Black")
+        cover_gray_action = cover_menu.addAction("Light Gray")
+        cover_yellow_action = cover_menu.addAction("Yellow")
+        cover_custom_action = cover_menu.addAction("Custom...")
+        remove_covers_action = menu.addAction("Remove Covers in Box")
+
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            self.view.setFocus()
+            return
+        if chosen == comment_action:
+            self.create_comment_from_selected_rectangle()
+        elif chosen == learn_action:
+            self.learn_equation_format_from_selected_rectangle()
+        elif chosen == copy_text_action:
+            self.copy_text_from_selected_rectangle()
+        elif chosen == remove_covers_action:
+            self.remove_covers_in_selected_rectangle()
+        elif chosen in (
+            cover_white_action,
+            cover_black_action,
+            cover_gray_action,
+            cover_yellow_action,
+            cover_custom_action,
+        ):
+            color_by_action = {
+                cover_white_action: "#FFFFFF",
+                cover_black_action: "#000000",
+                cover_gray_action: "#E5E7EB",
+                cover_yellow_action: "#FFF59D",
+            }
+            color = color_by_action.get(chosen)
+            if color is None:
+                picked = QColorDialog.getColor(QColor("#FFFFFF"), self, "Cover Color")
+                if not picked.isValid():
+                    self.view.setFocus()
+                    return
+                color = picked.name()
+            self.cover_selected_rectangle(color)
+        self.view.setFocus()
+
+    def cover_selected_rectangle(self, color: str) -> None:
+        session = self.current_session()
+        selected = self._selected_rectangle_pdf_rect()
+        if session is None or selected is None:
+            self.statusBar().showMessage("Select a rectangle first", 4000)
+            return
+        page, rect = selected
+        session.covers.append(PdfCover(page=page, rect=rect, color=color))
+        self._refresh_annotation_overlays(session)
+        self._save_session_state_now()
+        self.statusBar().showMessage(f"Covered selected box on page {page}", 5000)
+
+    def remove_covers_in_selected_rectangle(self) -> None:
+        session = self.current_session()
+        selected = self._selected_rectangle_pdf_rect()
+        if session is None or selected is None:
+            return
+        page, rect = selected
+        selection_rect = fitz.Rect(rect)
+        before = len(session.covers)
+        session.covers = [
+            cover
+            for cover in session.covers
+            if cover.page != page or not fitz.Rect(cover.rect).intersects(selection_rect)
+        ]
+        removed = before - len(session.covers)
+        self._refresh_annotation_overlays(session)
+        self._save_session_state_now()
+        self.statusBar().showMessage(f"Removed {removed} cover{'s' if removed != 1 else ''}", 5000)
+
+    def copy_text_from_selected_rectangle(self) -> None:
+        session = self.current_session()
+        selected = self._selected_rectangle_pdf_rect()
+        if session is None or selected is None:
+            return
+        page_number, rect = selected
+        try:
+            page = session.doc.load_page(page_number - 1)
+            text = page.get_text("text", clip=fitz.Rect(rect) & page.rect, sort=True).strip()
+        except Exception as exc:
+            self.statusBar().showMessage(f"Could not copy selected text: {exc}", 6000)
+            return
+        if not text:
+            self.statusBar().showMessage("No extractable text in selected box", 4000)
+            return
+        QApplication.clipboard().setText(text)
+        self.statusBar().showMessage(f"Copied text from selected box on page {page_number}", 5000)
+
     def create_comment_from_selected_rectangle(self) -> None:
         session = self.current_session()
         if session is None:
             return
 
-        selected = self.view.selected_learning_rect()
+        selected = self._selected_rectangle_pdf_rect()
         if selected is None:
             self.statusBar().showMessage(
                 "Hold left-click and drag a rectangle, then press Ctrl+T to comment on it",
@@ -1171,7 +1484,7 @@ class PdfReaderWindow(QMainWindow):
             )
             return
 
-        page, x0, y0, x1, y1 = selected
+        page, rect = selected
         dialog = CommentDialog(self.equation_macros, self)
         if dialog.exec() != QDialog.Accepted:
             self.view.setFocus()
@@ -1183,23 +1496,26 @@ class PdfReaderWindow(QMainWindow):
             return
         text = dialog.comment_text()
 
-        rect = (
-            min(x0, x1) / RENDER_SCALE,
-            min(y0, y1) / RENDER_SCALE,
-            max(x0, x1) / RENDER_SCALE,
-            max(y0, y1) / RENDER_SCALE,
-        )
         session.comments.append(PdfComment(page=page, rect=rect, text=text, color=dialog.comment_color()))
-        self.view.set_comment_overlays(session.comments)
+        self._refresh_annotation_overlays(session)
         self._save_session_state_now()
         self.statusBar().showMessage(f"Saved comment on page {page}", 5000)
         self.view.setFocus()
 
     def open_comment_at_index(self, index: int) -> None:
         session = self.current_session()
-        if session is None or not (0 <= index < len(session.comments)):
+        if session is None:
             return
-        comment = session.comments[index]
+        source = self._comment_source_for_display_index(session, index)
+        if source is None:
+            return
+        source_type, source_index = source
+        if source_type == "saved":
+            self._show_saved_pdf_comment(
+                session.saved_comment_edits.get(source_index, session.saved_pdf_comments[source_index])
+            )
+            return
+        comment = session.comments[source_index]
         dialog = CommentDialog(
             self.equation_macros,
             self,
@@ -1210,19 +1526,225 @@ class PdfReaderWindow(QMainWindow):
             self.view.setFocus()
             return
         if not dialog.has_comment_text():
-            del session.comments[index]
+            del session.comments[source_index]
             self.statusBar().showMessage("Deleted empty comment", 4000)
         else:
             text = dialog.comment_text()
-            session.comments[index] = PdfComment(
+            session.comments[source_index] = PdfComment(
                 page=comment.page,
                 rect=comment.rect,
                 text=text,
                 color=dialog.comment_color(),
             )
             self.statusBar().showMessage(f"Updated comment on page {comment.page}", 5000)
-        self.view.set_comment_overlays(session.comments)
+        self._refresh_annotation_overlays(session)
         self._save_session_state_now()
+        self.view.setFocus()
+
+    def show_comment_context_menu(self, index: int, global_pos: QPoint) -> None:
+        session = self.current_session()
+        if session is None or self._comment_source_for_display_index(session, index) is None:
+            return
+
+        menu = QMenu(self)
+        edit_action = menu.addAction("Edit Comment")
+        remove_action = menu.addAction("Remove Comment")
+        chosen = menu.exec(global_pos)
+        if chosen == edit_action:
+            self.edit_comment_at_index(index)
+        elif chosen == remove_action:
+            self.remove_comment_at_index(index)
+        self.view.setFocus()
+
+    def edit_comment_at_index(self, index: int) -> None:
+        session = self.current_session()
+        if session is None:
+            return
+        source = self._comment_source_for_display_index(session, index)
+        if source is None:
+            return
+        source_type, source_index = source
+        if source_type == "pending":
+            self.open_comment_at_index(index)
+            return
+        self._stage_saved_pdf_comment_edit(session, source_index)
+
+    def remove_comment_at_index(self, index: int) -> None:
+        session = self.current_session()
+        if session is None:
+            return
+        source = self._comment_source_for_display_index(session, index)
+        if source is None:
+            return
+        source_type, source_index = source
+        if source_type == "pending":
+            comment = session.comments[source_index]
+            del session.comments[source_index]
+            self._refresh_annotation_overlays(session)
+            self._save_session_state_now()
+            self.statusBar().showMessage(f"Removed comment on page {comment.page}", 5000)
+            return
+        self._stage_saved_pdf_comment_removal(session, source_index)
+
+    @staticmethod
+    def _rects_close(a: fitz.Rect, b: fitz.Rect, tolerance: float = 3.0) -> bool:
+        return (
+            abs(a.x0 - b.x0) <= tolerance
+            and abs(a.y0 - b.y0) <= tolerance
+            and abs(a.x1 - b.x1) <= tolerance
+            and abs(a.y1 - b.y1) <= tolerance
+        )
+
+    @staticmethod
+    def _annotation_content(annot) -> str:
+        try:
+            return str((annot.info or {}).get("content", "")).strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _comment_popup_rect(page: fitz.Page, rect: fitz.Rect) -> fitz.Rect:
+        page_rect = page.rect
+        width = min(260.0, max(160.0, page_rect.width * 0.4))
+        height = min(160.0, max(90.0, page_rect.height * 0.18))
+        x0 = rect.x1 + 12.0
+        if x0 + width > page_rect.x1:
+            x0 = max(page_rect.x0, rect.x0 - width - 12.0)
+        y0 = rect.y0
+        if y0 + height > page_rect.y1:
+            y0 = max(page_rect.y0, page_rect.y1 - height)
+        popup = fitz.Rect(x0, y0, x0 + width, y0 + height) & page_rect
+        return popup if not popup.is_empty else fitz.Rect(page_rect.x0, page_rect.y0, page_rect.x0 + width, page_rect.y0 + height) & page_rect
+
+    @staticmethod
+    def _set_pdf_reader_comment_annotation(
+        page: fitz.Page,
+        annot,
+        rect: fitz.Rect,
+        text: str,
+        color: Tuple[float, float, float],
+    ) -> None:
+        annot.set_colors(stroke=color)
+        annot.set_border(width=1.5, dashes=[4])
+        annot.set_info(content=text, subject="PDF Reader Comment", title="PDF Reader")
+        annot.set_popup(PdfReaderWindow._comment_popup_rect(page, rect))
+        annot.set_open(False)
+        annot.update()
+
+    def _matching_saved_comment_annotations(self, session: DocumentSession, comment: PdfComment) -> Tuple[Optional[fitz.Page], List[object], List[object]]:
+        if not (1 <= comment.page <= len(session.doc)):
+            return None, [], []
+        page = session.doc.load_page(comment.page - 1)
+        target = fitz.Rect(comment.rect) & page.rect
+        squares: List[object] = []
+        notes: List[object] = []
+        annotations = page.annots()
+        if annotations is None:
+            return page, squares, notes
+
+        for annot in annotations:
+            try:
+                info = annot.info or {}
+                if str(info.get("subject", "")) != "PDF Reader Comment":
+                    continue
+                annot_type = annot.type[0]
+                if annot_type == fitz.PDF_ANNOT_SQUARE and self._rects_close(annot.rect & page.rect, target):
+                    squares.append(annot)
+                elif annot_type == fitz.PDF_ANNOT_TEXT and self._annotation_content(annot) == comment.text.strip():
+                    icon_rect = annot.rect
+                    near_left = abs(icon_rect.x0 - target.x0) <= 24.0
+                    near_top = abs(icon_rect.y1 - target.y0) <= 32.0 or abs(icon_rect.y0 - target.y0) <= 32.0
+                    if near_left and near_top:
+                        notes.append(annot)
+            except Exception:
+                continue
+        return page, squares, notes
+
+    def _refresh_after_pdf_annotation_edit(self, session: DocumentSession) -> None:
+        session.saved_pdf_comments = self._load_pdf_reader_comments_from_pdf(session.doc)
+        session.saved_comment_edits.clear()
+        session.saved_comment_removals.clear()
+        session.rendered_pages = []
+        session.rendered_page_numbers.clear()
+        session.page_display_sizes = []
+        self._refresh_annotation_overlays(session)
+        self._refresh_bookmarks_panel()
+        self._ensure_rendered_pages(session)
+        for view in self.reader_views:
+            if not self._view_has_session(session, view):
+                continue
+            state = self._view_state_for_view(view)
+            self._show_session_in_view(view, session)
+            if state is not None:
+                self._apply_view_state_to_view(view, state)
+        self._save_session_state_now()
+
+    def _stage_saved_pdf_comment_edit(self, session: DocumentSession, saved_index: int) -> None:
+        comment = session.saved_comment_edits.get(saved_index, session.saved_pdf_comments[saved_index])
+        dialog = CommentDialog(
+            self.equation_macros,
+            self,
+            initial_text=comment.text,
+            initial_color=comment.color,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            self.view.setFocus()
+            return
+        if not dialog.has_comment_text():
+            self._stage_saved_pdf_comment_removal(session, saved_index)
+            return
+
+        text = dialog.comment_text()
+        session.saved_comment_edits[saved_index] = PdfComment(
+            page=comment.page,
+            rect=comment.rect,
+            text=text,
+            color=dialog.comment_color(),
+        )
+        self._refresh_annotation_overlays(session)
+        self._save_session_state_now()
+        self.statusBar().showMessage(f"Staged comment update on page {comment.page}; press Save Changes to write it", 7000)
+        self.view.setFocus()
+
+    def _stage_saved_pdf_comment_removal(self, session: DocumentSession, saved_index: int) -> None:
+        comment = session.saved_comment_edits.get(saved_index, session.saved_pdf_comments[saved_index])
+        result = QMessageBox.question(
+            self,
+            "Remove Comment",
+            f"Remove the saved comment on page {comment.page}?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if result != QMessageBox.Yes:
+            self.view.setFocus()
+            return
+
+        session.saved_comment_removals.add(saved_index)
+        session.saved_comment_edits.pop(saved_index, None)
+        self._refresh_annotation_overlays(session)
+        self._save_session_state_now()
+        self.statusBar().showMessage(f"Staged comment removal on page {comment.page}; press Save Changes to write it", 7000)
+        self.view.setFocus()
+
+    def _show_saved_pdf_comment(self, comment: PdfComment) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Saved comment on page {comment.page}")
+        dialog.resize(520, 320)
+
+        layout = QVBoxLayout(dialog)
+        viewer = QTextEdit(dialog)
+        viewer.setReadOnly(True)
+        if "<html" in comment.text.lower() or "<span" in comment.text.lower() or "<p" in comment.text.lower():
+            viewer.setHtml(comment.text)
+        else:
+            viewer.setPlainText(comment.text)
+        layout.addWidget(viewer, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, dialog)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        dialog.exec()
         self.view.setFocus()
 
     def _clear_menu_documents(self) -> None:
@@ -1413,6 +1935,12 @@ class PdfReaderWindow(QMainWindow):
             self.copy_between_selection_lines,
             "copy_between_lines",
         )
+        self.copy_between_lines_without_equations_action = self._create_action(
+            "Copy Between Blue Lines Without Equations",
+            SHORTCUT_COPY_BETWEEN_LINES_WITHOUT_EQUATIONS,
+            self.copy_between_selection_lines_without_equations,
+            "copy_between_lines_without_equations",
+        )
         self.clear_selection_lines_action = self._create_action(
             "Clear Blue Lines",
             SHORTCUT_CLEAR_SELECTION_LINES,
@@ -1442,6 +1970,12 @@ class PdfReaderWindow(QMainWindow):
             SHORTCUT_CLOSE_VIEWER,
             self.close_active_viewer,
             "close_viewer",
+        )
+        self.rotate_viewer_segments_action = self._create_action(
+            "Rotate Viewer Segments",
+            SHORTCUT_ROTATE_VIEWER_SEGMENTS,
+            self.rotate_viewer_segments,
+            "rotate_viewer_segments",
         )
         self.return_to_text_search_source_action = self._create_action(
             "Return to Text Search Source",
@@ -1473,10 +2007,17 @@ class PdfReaderWindow(QMainWindow):
             self.toggle_equation_lookup_mode,
             "toggle_equation_lookup",
         )
+        self.save_changes_action = self._create_action(
+            "Save Changes",
+            SHORTCUT_SAVE_CHANGES,
+            self.save_current_document_changes,
+            "save_changes",
+        )
 
         toolbar = QToolBar("Main")
         toolbar.addAction(self.menu_action)
         toolbar.addAction(self.open_many_action)
+        toolbar.addAction(self.save_changes_action)
         toolbar.addSeparator()
         toolbar.addAction(self.back_action)
         toolbar.addAction(self.forward_action)
@@ -1539,6 +2080,20 @@ class PdfReaderWindow(QMainWindow):
         if self.current_index != target_index:
             self._switch_to_document(target_index)
 
+    def switch_to_adjacent_document(self, direction: int) -> None:
+        if len(self.sessions) < 2:
+            return
+
+        current = self.doc_tabs.currentIndex()
+        if current < 0:
+            current = self.current_index if self.current_index >= 0 else 0
+
+        target_index = (current + direction) % len(self.sessions)
+        self.show_reader()
+        self.doc_tabs.setCurrentIndex(target_index)
+        if self.current_index != target_index:
+            self._switch_to_document(target_index)
+
     def _session_display_name(self, path: str) -> str:
         cloud_name = self._cloud_cache_display_name(path)
         if cloud_name:
@@ -1559,6 +2114,490 @@ class PdfReaderWindow(QMainWindow):
             return ""
         name = str(data.get("name") or "").strip()
         return name
+
+    @staticmethod
+    def _cloud_cache_metadata(path: str) -> dict:
+        file_path = Path(path)
+        meta_path = file_path.with_suffix(file_path.suffix + ".json")
+        if not meta_path.exists():
+            return {}
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _cloud_document_id_for_path(self, path: str) -> str:
+        return str(self._cloud_cache_metadata(path).get("id") or "").strip()
+
+    @staticmethod
+    def _annotation_cache_path_for_pdf(path: str) -> Path:
+        file_path = Path(path)
+        return file_path.with_suffix(file_path.suffix + ".annotations.json")
+
+    @staticmethod
+    def _qcolor_to_pdf_rgb(color_text: str, fallback: str = "#FFFFFF") -> Tuple[float, float, float]:
+        color = QColor(color_text)
+        if not color.isValid():
+            color = QColor(fallback)
+        return color.redF(), color.greenF(), color.blueF()
+
+    @staticmethod
+    def _annotation_stroke_rgb(annot, fallback: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        stroke = (annot.colors or {}).get("stroke")
+        if stroke and len(stroke) >= 3:
+            return (
+                max(0.0, min(1.0, float(stroke[0]))),
+                max(0.0, min(1.0, float(stroke[1]))),
+                max(0.0, min(1.0, float(stroke[2]))),
+            )
+        return fallback
+
+    @staticmethod
+    def _annotation_stroke_color_text(annot, fallback: str = "#2EAD4A") -> str:
+        return QColor.fromRgbF(*PdfReaderWindow._annotation_stroke_rgb(annot, PdfReaderWindow._qcolor_to_pdf_rgb(fallback))).name()
+
+    def _embed_pending_annotations_in_pdf(self, session: DocumentSession) -> Tuple[int, int]:
+        cover_count = 0
+        comment_count = 0
+
+        covers_by_page: Dict[int, List[PdfCover]] = {}
+        for cover in session.covers:
+            covers_by_page.setdefault(cover.page, []).append(cover)
+
+        for page_number, covers in covers_by_page.items():
+            if not (1 <= page_number <= len(session.doc)):
+                continue
+            page = session.doc.load_page(page_number - 1)
+            added = 0
+            for cover in covers:
+                rect = fitz.Rect(cover.rect) & page.rect
+                if rect.is_empty:
+                    continue
+                fill = self._qcolor_to_pdf_rgb(cover.color, "#FFFFFF")
+                try:
+                    page.add_redact_annot(rect, fill=fill)
+                    added += 1
+                except Exception:
+                    continue
+            if added:
+                page.apply_redactions()
+                cover_count += added
+
+        for comment in session.comments:
+            if not (1 <= comment.page <= len(session.doc)):
+                continue
+            page = session.doc.load_page(comment.page - 1)
+            rect = fitz.Rect(comment.rect) & page.rect
+            if rect.is_empty:
+                continue
+            color = self._qcolor_to_pdf_rgb(comment.color, "#2EAD4A")
+            plain_text = self._plain_comment_text(comment.text) or "Comment"
+            try:
+                rect_annot = page.add_rect_annot(rect)
+                self._set_pdf_reader_comment_annotation(page, rect_annot, rect, plain_text, color)
+                comment_count += 1
+            except Exception:
+                continue
+
+        return cover_count, comment_count
+
+    def _embed_pending_bookmarks_in_pdf(self, session: DocumentSession) -> int:
+        if not session.user_bookmarks:
+            return 0
+
+        try:
+            toc = session.doc.get_toc(simple=True)
+        except Exception:
+            toc = []
+
+        existing = set()
+        for entry in toc:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 3:
+                continue
+            try:
+                existing.add((str(entry[1]).strip(), int(entry[2])))
+            except Exception:
+                continue
+
+        added = 0
+        for bookmark in session.user_bookmarks:
+            page = max(1, min(int(bookmark.page), len(session.doc)))
+            title = str(bookmark.title).strip() or f"Page {page}"
+            key = (title, page)
+            if key in existing:
+                continue
+            toc.append([1, title, page])
+            existing.add(key)
+            added += 1
+
+        if added:
+            session.doc.set_toc(toc)
+            session.section_starts = extract_section_starts_from_toc(session.doc)
+        return added
+
+    def _save_pdf_full_replace(self, session: DocumentSession) -> None:
+        source_path = Path(session.path)
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{source_path.stem}.save-",
+                suffix=source_path.suffix,
+                dir=str(source_path.parent),
+                delete=False,
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+
+            session.doc.save(str(tmp_path), garbage=4, deflate=True)
+            session.doc.close()
+            tmp_path.replace(source_path)
+            session.doc = fitz.open(session.path)
+        except Exception:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            try:
+                if session.doc.is_closed:
+                    session.doc = fitz.open(session.path)
+            except Exception:
+                pass
+            raise
+
+    def _apply_pending_saved_comment_changes(self, session: DocumentSession) -> Tuple[int, int]:
+        removed_count = 0
+        edited_count = 0
+
+        for saved_index in sorted(session.saved_comment_removals, reverse=True):
+            if not (0 <= saved_index < len(session.saved_pdf_comments)):
+                continue
+            original = session.saved_pdf_comments[saved_index]
+            page, squares, notes = self._matching_saved_comment_annotations(session, original)
+            if page is None:
+                continue
+            for annot in notes + squares:
+                page.delete_annot(annot)
+            if squares:
+                removed_count += 1
+
+        for saved_index, edited in sorted(session.saved_comment_edits.items()):
+            if saved_index in session.saved_comment_removals:
+                continue
+            if not (0 <= saved_index < len(session.saved_pdf_comments)):
+                continue
+            original = session.saved_pdf_comments[saved_index]
+            page, squares, notes = self._matching_saved_comment_annotations(session, original)
+            if page is None or not squares:
+                continue
+            color = self._qcolor_to_pdf_rgb(edited.color, "#2EAD4A")
+            plain_text = self._plain_comment_text(edited.text) or "Comment"
+            for annot in squares:
+                self._set_pdf_reader_comment_annotation(page, annot, fitz.Rect(original.rect) & page.rect, plain_text, color)
+            for note in notes:
+                page.delete_annot(note)
+            edited_count += 1
+
+        return edited_count, removed_count
+
+    def _remove_pdf_reader_comment_note_icons(self, session: DocumentSession) -> int:
+        removed = 0
+        for page_index in range(len(session.doc)):
+            try:
+                page = session.doc.load_page(page_index)
+                annotations = list(page.annots() or [])
+            except Exception:
+                continue
+            for annot in annotations:
+                try:
+                    info = annot.info or {}
+                    if str(info.get("subject", "")) != "PDF Reader Comment":
+                        continue
+                    if annot.type[0] != fitz.PDF_ANNOT_TEXT:
+                        continue
+                    page.delete_annot(annot)
+                    removed += 1
+                except Exception:
+                    continue
+        return removed
+
+    def _repair_pdf_reader_comment_popups(self, session: DocumentSession) -> int:
+        repaired = 0
+        for page_index in range(len(session.doc)):
+            try:
+                page = session.doc.load_page(page_index)
+                annotations = list(page.annots() or [])
+            except Exception:
+                continue
+            for annot in annotations:
+                try:
+                    info = annot.info or {}
+                    if str(info.get("subject", "")) != "PDF Reader Comment":
+                        continue
+                    if annot.type[0] != fitz.PDF_ANNOT_SQUARE:
+                        continue
+                    if annot.has_popup:
+                        continue
+                    text = str(info.get("content", "")).strip()
+                    if not text:
+                        continue
+                    rect = annot.rect & page.rect
+                    if rect.is_empty:
+                        continue
+                    color = PdfReaderWindow._annotation_stroke_rgb(annot, (0.18, 0.68, 0.29))
+                    PdfReaderWindow._set_pdf_reader_comment_annotation(page, annot, rect, text, color)
+                    repaired += 1
+                except Exception:
+                    continue
+        return repaired
+
+    @staticmethod
+    def _load_pdf_reader_comments_from_pdf(doc: fitz.Document) -> List[PdfComment]:
+        comments: List[PdfComment] = []
+        for page_index in range(len(doc)):
+            try:
+                page = doc.load_page(page_index)
+                annotations = page.annots()
+            except Exception:
+                continue
+            if annotations is None:
+                continue
+            for annot in annotations:
+                try:
+                    info = annot.info or {}
+                    if str(info.get("subject", "")) != "PDF Reader Comment":
+                        continue
+                    if annot.type[0] != fitz.PDF_ANNOT_SQUARE:
+                        continue
+                    text = str(info.get("content", "")).strip()
+                    if not text:
+                        continue
+                    rect = annot.rect & page.rect
+                    if rect.is_empty:
+                        continue
+                    color = PdfReaderWindow._annotation_stroke_color_text(annot, "#2EAD4A")
+                    comments.append(
+                        PdfComment(
+                            page=page_index + 1,
+                            rect=(float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)),
+                            text=text,
+                            color=color,
+                        )
+                    )
+                except Exception:
+                    continue
+        return comments
+
+    @staticmethod
+    def _pdf_incremental_save_error() -> str:
+        return (
+            "This PDF cannot accept an appended incremental update, likely because it was repaired when opened. "
+            "No comments were written to the file."
+        )
+
+    @staticmethod
+    def _ensure_pdf_can_append(session: DocumentSession) -> None:
+        if not session.doc.can_save_incrementally():
+            raise RuntimeError(PdfReaderWindow._pdf_incremental_save_error())
+
+    @staticmethod
+    def _save_pdf_incrementally(session: DocumentSession) -> None:
+        PdfReaderWindow._ensure_pdf_can_append(session)
+        session.doc.saveIncr()
+
+    def _refresh_after_pdf_file_save(self, session: DocumentSession) -> None:
+        session.comments.clear()
+        session.covers.clear()
+        session.user_bookmarks.clear()
+        session.section_starts = extract_section_starts_from_toc(session.doc)
+        session.saved_pdf_comments = self._load_pdf_reader_comments_from_pdf(session.doc)
+        session.saved_comment_edits.clear()
+        session.saved_comment_removals.clear()
+        session.rendered_pages = []
+        session.rendered_page_numbers.clear()
+        session.page_display_sizes = []
+        self._refresh_annotation_overlays(session)
+        self._ensure_rendered_pages(session)
+        for view in self.reader_views:
+            if not self._view_has_session(session, view):
+                continue
+            state = self._view_state_for_view(view)
+            self._show_session_in_view(view, session)
+            if state is not None:
+                self._apply_view_state_to_view(view, state)
+
+    def _remove_annotation_cache_for_session(self, session: DocumentSession) -> None:
+        try:
+            self._annotation_cache_path_for_pdf(session.path).unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    def _upload_saved_pdf_to_cloud(self, session: DocumentSession) -> str:
+        document_id = self._cloud_document_id_for_path(session.path)
+        if not document_id:
+            return ""
+        if not self.google_drive.is_logged_in:
+            raise GoogleDriveError("Sign in to Google Drive to upload the saved PDF.")
+
+        metadata = self._cloud_cache_metadata(session.path)
+        mime_type = str(metadata.get("mime_type") or "")
+        if mime_type and mime_type != "application/pdf":
+            uploaded = self.google_drive.upload_pdf(Path(session.path))
+            self.cloud_documents = [uploaded] + [
+                document for document in self.cloud_documents if document.id != uploaded.id
+            ]
+            return f"uploaded a PDF copy to Google Drive ({uploaded.name})"
+
+        updated = self.google_drive.update_pdf_media(document_id, Path(session.path))
+        self.cloud_documents = [updated] + [
+            document for document in self.cloud_documents if document.id != updated.id
+        ]
+        meta_path = Path(session.path).with_suffix(Path(session.path).suffix + ".json")
+        metadata.update(
+            {
+                "id": updated.id,
+                "name": updated.name,
+                "mime_type": updated.mime_type,
+                "modified_time": updated.modified_time,
+                "size": updated.size,
+            }
+        )
+        try:
+            meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return "uploaded the updated PDF to Google Drive"
+
+    def save_current_document_changes(self) -> None:
+        session = self.current_session()
+        if session is None:
+            self.statusBar().showMessage("No document is open", 3000)
+            return
+
+        pending_covers = len(session.covers)
+        pending_comments = len(session.comments)
+        pending_bookmarks = len(session.user_bookmarks)
+        pending_saved_comment_changes = len(session.saved_comment_edits) + len(session.saved_comment_removals)
+        if pending_covers == 0 and pending_comments == 0 and pending_bookmarks == 0 and pending_saved_comment_changes == 0:
+            self._save_active_session_view()
+            if not session.doc.can_save_incrementally():
+                self._save_session_state_now()
+                self.statusBar().showMessage("No pending comments, rectangles, or bookmarks to write into the PDF", 4000)
+                return
+            self.statusBar().showMessage("Checking saved PDF comments...", 0)
+            QApplication.processEvents()
+            try:
+                removed_note_icons = self._remove_pdf_reader_comment_note_icons(session)
+                repaired_comment_popups = self._repair_pdf_reader_comment_popups(session)
+                if removed_note_icons or repaired_comment_popups:
+                    self._save_pdf_incrementally(session)
+            except Exception as exc:
+                QMessageBox.warning(self, "Save PDF", f"Could not update saved PDF comments:\n{exc}")
+                return
+
+            if removed_note_icons or repaired_comment_popups:
+                self._refresh_after_pdf_annotation_edit(session)
+                self.recent_document_entries[self._path_key(session.path)] = self._session_persistence_entry(session)
+                self._save_session_state_now()
+                change_parts = []
+                if repaired_comment_popups:
+                    change_parts.append(f"made {repaired_comment_popups} comment(s) Acrobat-readable")
+                if removed_note_icons:
+                    change_parts.append(f"removed {removed_note_icons} old comment icon(s)")
+                change_message = " and ".join(change_parts)
+                document_id = self._cloud_document_id_for_path(session.path)
+                if document_id:
+                    try:
+                        self.statusBar().showMessage("Uploading the updated PDF to Google Drive...", 0)
+                        QApplication.processEvents()
+                        cloud_message = self._upload_saved_pdf_to_cloud(session)
+                        self.statusBar().showMessage(
+                            f"{change_message} and {cloud_message}",
+                            7000,
+                        )
+                    except GoogleDriveError as exc:
+                        self.statusBar().showMessage(
+                            f"{change_message} locally; Google Drive upload failed: {exc}",
+                            9000,
+                        )
+                else:
+                    self.statusBar().showMessage(
+                        change_message,
+                        6000,
+                    )
+                return
+
+            self._save_session_state_now()
+            self.statusBar().showMessage("No pending comments, rectangles, or bookmarks to write into the PDF", 4000)
+            return
+
+        self._save_active_session_view()
+        self.statusBar().showMessage("Writing comments, rectangles, and bookmarks into the PDF...", 0)
+        QApplication.processEvents()
+
+        try:
+            full_save_required = bool(pending_covers or pending_bookmarks)
+            if not full_save_required and not self._repair_pdf_in_place_for_append(session):
+                return
+            removed_note_icons = self._remove_pdf_reader_comment_note_icons(session)
+            repaired_comment_popups = self._repair_pdf_reader_comment_popups(session)
+            edited_saved_comments, removed_saved_comments = self._apply_pending_saved_comment_changes(session)
+            cover_count, comment_count = self._embed_pending_annotations_in_pdf(session)
+            bookmark_count = self._embed_pending_bookmarks_in_pdf(session)
+            if full_save_required:
+                self._save_pdf_full_replace(session)
+            else:
+                self._save_pdf_incrementally(session)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save PDF", f"Could not save changes into the PDF:\n{exc}")
+            return
+
+        self._remove_annotation_cache_for_session(session)
+        self._refresh_after_pdf_file_save(session)
+        self.recent_document_entries[self._path_key(session.path)] = self._session_persistence_entry(session)
+        self._save_session_state_now()
+
+        document_id = self._cloud_document_id_for_path(session.path)
+        cleanup_parts = []
+        if repaired_comment_popups:
+            cleanup_parts.append(f"made {repaired_comment_popups} existing comment(s) Acrobat-readable")
+        if removed_note_icons:
+            cleanup_parts.append(f"removed {removed_note_icons} old comment icon(s)")
+        if edited_saved_comments:
+            cleanup_parts.append(f"updated {edited_saved_comments} saved comment(s)")
+        if removed_saved_comments:
+            cleanup_parts.append(f"removed {removed_saved_comments} saved comment(s)")
+        cleanup_message = f" and {' and '.join(cleanup_parts)}" if cleanup_parts else ""
+        main_parts = [
+            f"{comment_count} comment(s)",
+            f"{cover_count} rectangle(s)",
+            f"{bookmark_count} bookmark(s)",
+        ]
+        main_message = f"Wrote {', '.join(main_parts)} into the PDF"
+        if not document_id:
+            self.statusBar().showMessage(
+                f"{main_message}{cleanup_message}",
+                6000,
+            )
+            return
+
+        try:
+            self.statusBar().showMessage("Uploading the updated PDF to Google Drive...", 0)
+            QApplication.processEvents()
+            cloud_message = self._upload_saved_pdf_to_cloud(session)
+        except GoogleDriveError as exc:
+            self.statusBar().showMessage(
+                f"Saved into the local PDF; Google Drive upload failed: {exc}",
+                9000,
+            )
+            return
+
+        self.statusBar().showMessage(
+            f"{main_message}{cleanup_message} and {cloud_message}",
+            7000,
+        )
 
     def _set_no_document_ui(self) -> None:
         self.current_index = -1
@@ -1737,7 +2776,7 @@ class PdfReaderWindow(QMainWindow):
             self.page_input.setMaximum(len(session.doc))
             self.page_input.setValue(page_number)
             self.page_input.blockSignals(False)
-            self.view.set_comment_overlays(session.comments)
+            self._refresh_annotation_overlays(session)
             self._update_status()
             self.view.setFocus()
 
@@ -1937,6 +2976,8 @@ class PdfReaderWindow(QMainWindow):
             self.status_label.setText("No PDF loaded")
             self.zoom_label.setText("100%")
             return
+        if self._suspend_view_updates:
+            return
         sender = self.sender()
         changed_view = sender if isinstance(sender, PdfView) else self.view
         if not self._view_has_session(session, changed_view):
@@ -2059,6 +3100,7 @@ class PdfReaderWindow(QMainWindow):
         restored_user_bookmarks: Optional[List[UserBookmark]] = None,
         restored_selection_lines: Optional[List[SelectionLine]] = None,
         restored_comments: Optional[List[PdfComment]] = None,
+        restored_covers: Optional[List[PdfCover]] = None,
         restored_last_equation_return_state: Optional[ViewState] = None,
         restored_equation_numbering_mode: str = EQUATION_MODE_SECTION,
         restored_equation_index: Optional[Dict[str, EquationLocation]] = None,
@@ -2112,6 +3154,8 @@ class PdfReaderWindow(QMainWindow):
             user_bookmarks=restored_user_bookmarks[:] if restored_user_bookmarks else [],
             selection_lines=restored_selection_lines[:] if restored_selection_lines else [],
             comments=restored_comments[:] if restored_comments else [],
+            saved_pdf_comments=self._load_pdf_reader_comments_from_pdf(doc),
+            covers=restored_covers[:] if restored_covers else [],
             last_equation_return_state=restored_last_equation_return_state,
             equation_numbering_mode=(
                 restored_equation_numbering_mode
@@ -2263,7 +3307,7 @@ class PdfReaderWindow(QMainWindow):
             self._switching_docs = False
 
         self._refresh_bookmarks_panel()
-        self.view.set_comment_overlays(session.comments)
+        self._refresh_annotation_overlays(session)
         self._sync_text_search_panel()
         if self.search_dock.isVisible() and session.text_search_query and not session.text_search_complete:
             self._text_search_timer.start(0)
@@ -4730,7 +5774,7 @@ do {
         self._redraw_selection_lines()
         self.statusBar().showMessage(
             f"Added blue line {len(session.selection_lines)} on page {page}. "
-            f"Press Shift+C to copy between the two most recent lines, or Shift+X to clear all blue lines.",
+            f"Press Shift+C to copy with equation context, Shift+V to copy without it, or Shift+X to clear all blue lines.",
             7000,
         )
 
@@ -4739,9 +5783,15 @@ do {
         if session is None:
             return
 
+        state = self._layout_change_view_state()
         count = len(session.selection_lines)
-        session.selection_lines.clear()
-        self._redraw_selection_lines()
+        self._suspend_view_updates = True
+        try:
+            session.selection_lines.clear()
+            self._redraw_selection_lines()
+            self._restore_layout_change_view_state(state)
+        finally:
+            self._suspend_view_updates = False
         self._save_active_session_view()
         self.statusBar().showMessage(
             f"Cleared {count} blue line{'s' if count != 1 else ''}.",
@@ -4961,7 +6011,7 @@ do {
 
         return "\n\n".join(blocks)
 
-    def copy_between_selection_lines(self) -> None:
+    def _copy_between_selection_lines(self, include_equation_context: bool) -> None:
         session = self.current_session()
         if session is None:
             return
@@ -4976,7 +6026,7 @@ do {
             return
 
         refs = self._find_parenthesized_equation_refs(body_text)
-        equation_context = self._export_equation_context(session, refs)
+        equation_context = self._export_equation_context(session, refs) if include_equation_context else ""
         comments_context = self._export_comments_context(session, first, second)
         start, end = sorted([first, second], key=self._selection_sort_key)
 
@@ -4989,7 +6039,7 @@ do {
             "MAIN TEXT:",
             body_text,
         ]
-        if refs:
+        if include_equation_context and refs:
             copied_parts.extend([
                 "",
                 "EQUATIONS NEEDED FOR CONTEXT:",
@@ -5009,16 +6059,93 @@ do {
         clipboard_text = "\n".join(part for part in copied_parts if part is not None)
         QApplication.clipboard().setText(clipboard_text)
         comment_count = comments_context.count("[Comment ")
+        equation_message = (
+            f"{len(refs)} referenced equations and "
+            if include_equation_context
+            else "equation references skipped; "
+        )
         self.statusBar().showMessage(
-            f"Copied section between the two most recent blue lines; {len(refs)} referenced equations and {comment_count} comments included",
+            f"Copied section between the two most recent blue lines; {equation_message}{comment_count} comments included",
             8000,
         )
 
+    def copy_between_selection_lines(self) -> None:
+        self._copy_between_selection_lines(include_equation_context=True)
+
+    def copy_between_selection_lines_without_equations(self) -> None:
+        self._copy_between_selection_lines(include_equation_context=False)
+
     def toggle_bookmarks_panel(self) -> None:
         visible = self.bookmarks_dock.isVisible()
-        self.bookmarks_dock.setVisible(not visible)
-        if not visible:
+        if visible:
+            self._hide_bookmarks_panel()
+        else:
+            self._show_bookmarks_panel()
+
+    def _hide_bookmarks_panel(self) -> None:
+        state = self._layout_change_view_state()
+        self._suspend_view_updates = True
+        try:
+            self.bookmarks_dock.hide()
+            self._restore_layout_change_view_state(state)
+        finally:
+            self._suspend_view_updates = False
+        QTimer.singleShot(0, lambda saved_state=state: self._restore_layout_change_view_state(saved_state))
+
+    def _show_bookmarks_panel(self) -> None:
+        state = self._layout_change_view_state()
+        self._suspend_view_updates = True
+        try:
             self._refresh_bookmarks_panel()
+            self.bookmarks_dock.show()
+            self.bookmarks_dock.raise_()
+            self._restore_layout_change_view_state(state)
+        finally:
+            self._suspend_view_updates = False
+        QTimer.singleShot(0, lambda saved_state=state: self._ensure_bookmarks_dock_width(saved_state))
+
+    def _ensure_bookmarks_dock_width(self, state: Optional[ViewState] = None) -> None:
+        state = state or self._layout_change_view_state()
+        self._suspend_view_updates = True
+        try:
+            if self.bookmarks_dock.isVisible() and self.bookmarks_dock.width() < BOOKMARKS_DOCK_MIN_WIDTH:
+                self.resizeDocks(
+                    [self.bookmarks_dock],
+                    [BOOKMARKS_DOCK_DEFAULT_WIDTH],
+                    Qt.Horizontal,
+                )
+            self._restore_layout_change_view_state(state)
+        finally:
+            self._suspend_view_updates = False
+
+    def _layout_change_view_state(self) -> Optional[ViewState]:
+        session = self.current_session()
+        if session is None or not self._view_has_session(session):
+            return None
+        return ViewState(
+            page=session.current_page,
+            scroll_x=self.view.horizontalScrollBar().value(),
+            scroll_y=self.view.verticalScrollBar().value(),
+            zoom=self.view.zoom_factor(),
+        )
+
+    def _restore_layout_change_view_state(self, state: Optional[ViewState]) -> None:
+        session = self.current_session()
+        if state is None or session is None or not self._view_has_session(session):
+            return
+        was_suspended = self._suspend_view_updates
+        self._suspend_view_updates = True
+        try:
+            self.view.set_zoom_factor(state.zoom)
+            self.view.horizontalScrollBar().setValue(state.scroll_x)
+            self.view.verticalScrollBar().setValue(state.scroll_y)
+            session.current_page = state.page
+            self.page_input.blockSignals(True)
+            self.page_input.setValue(state.page)
+            self.page_input.blockSignals(False)
+            self._update_status()
+        finally:
+            self._suspend_view_updates = was_suspended
 
     def add_bookmark(self) -> None:
         session = self.current_session()
@@ -5038,6 +6165,7 @@ do {
         title = title.strip() or default_title
         session.user_bookmarks.append(UserBookmark(title=title, page=session.current_page))
         self._refresh_bookmarks_panel()
+        self._save_session_state_now()
         self.statusBar().showMessage(f"Added bookmark '{title}' on page {session.current_page}", 4000)
 
     def _get_pdf_toc(self, session: DocumentSession) -> List[list]:
@@ -5149,22 +6277,21 @@ do {
         return out
 
     @staticmethod
-    def _serialize_comments(comments: List[PdfComment]) -> List[dict]:
+    def _serialize_covers(covers: List[PdfCover]) -> List[dict]:
         return [
             {
-                "page": comment.page,
-                "rect": list(comment.rect),
-                "text": comment.text,
-                "color": comment.color,
+                "page": cover.page,
+                "rect": list(cover.rect),
+                "color": cover.color,
             }
-            for comment in comments
+            for cover in covers
         ]
 
     @staticmethod
-    def _deserialize_comments(entries: object) -> List[PdfComment]:
+    def _deserialize_covers(entries: object) -> List[PdfCover]:
         if not isinstance(entries, list):
             return []
-        out: List[PdfComment] = []
+        out: List[PdfCover] = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -5174,12 +6301,10 @@ do {
                 if not isinstance(raw_rect, list) or len(raw_rect) != 4:
                     continue
                 rect = tuple(float(value) for value in raw_rect)
-                text = str(entry.get("text", "")).strip()
-                color = str(entry.get("color", "#2EAD4A"))
+                color = str(entry.get("color", "#FFFFFF"))
             except Exception:
                 continue
-            if text:
-                out.append(PdfComment(page=page, rect=rect, text=text, color=color))
+            out.append(PdfCover(page=page, rect=rect, color=color))
         return out
 
     @staticmethod
@@ -5322,7 +6447,7 @@ do {
             "history_forward": [self._serialize_view_state(v) for v in session.history_forward],
             "user_bookmarks": self._serialize_user_bookmarks(session.user_bookmarks),
             "selection_lines": self._serialize_selection_lines(session.selection_lines),
-            "comments": self._serialize_comments(session.comments),
+            "covers": self._serialize_covers(session.covers),
             "last_equation_return_state": (
                 self._serialize_view_state(session.last_equation_return_state)
                 if session.last_equation_return_state is not None
@@ -5357,7 +6482,7 @@ do {
         for path in self.recent_documents:
             entry = self.recent_document_entries.get(self._path_key(path))
             if entry:
-                recent_entries.append(dict(entry))
+                recent_entries.append(self._strip_comment_metadata(entry))
             else:
                 recent_entries.append({"path": path})
 
@@ -5414,8 +6539,9 @@ do {
             restored_selection_lines = self._deserialize_selection_lines(
                 doc_entry.get("selection_lines", [])
             )
-            restored_comments = self._deserialize_comments(
-                doc_entry.get("comments", [])
+            restored_comments = []
+            restored_covers = self._deserialize_covers(
+                doc_entry.get("covers", [])
             )
             raw_return_state = doc_entry.get("last_equation_return_state")
             restored_last_equation_return_state = (
@@ -5467,6 +6593,7 @@ do {
             restored_user_bookmarks = []
             restored_selection_lines = []
             restored_comments = []
+            restored_covers = []
             restored_last_equation_return_state = None
             restored_equation_numbering_mode = EQUATION_MODE_SECTION
             restored_equation_lookup_mode = EQUATION_LOOKUP_SCAN
@@ -5489,6 +6616,7 @@ do {
             restored_user_bookmarks=restored_user_bookmarks,
             restored_selection_lines=restored_selection_lines,
             restored_comments=restored_comments,
+            restored_covers=restored_covers,
             restored_last_equation_return_state=restored_last_equation_return_state,
             restored_equation_numbering_mode=restored_equation_numbering_mode,
             restored_equation_index=restored_equation_index,
@@ -5546,8 +6674,9 @@ do {
                     restored_selection_lines = self._deserialize_selection_lines(
                         doc_entry.get("selection_lines", [])
                     )
-                    restored_comments = self._deserialize_comments(
-                        doc_entry.get("comments", [])
+                    restored_comments = []
+                    restored_covers = self._deserialize_covers(
+                        doc_entry.get("covers", [])
                     )
                     raw_return_state = doc_entry.get("last_equation_return_state")
                     restored_last_equation_return_state = (
@@ -5599,6 +6728,7 @@ do {
                     restored_user_bookmarks = []
                     restored_selection_lines = []
                     restored_comments = []
+                    restored_covers = []
                     restored_last_equation_return_state = None
                     restored_equation_numbering_mode = EQUATION_MODE_SECTION
                     restored_equation_lookup_mode = EQUATION_LOOKUP_SCAN
@@ -5621,6 +6751,7 @@ do {
                     restored_user_bookmarks=restored_user_bookmarks,
                     restored_selection_lines=restored_selection_lines,
                     restored_comments=restored_comments,
+                    restored_covers=restored_covers,
                     restored_last_equation_return_state=restored_last_equation_return_state,
                     restored_equation_numbering_mode=restored_equation_numbering_mode,
                     restored_equation_index=restored_equation_index,
@@ -5643,7 +6774,85 @@ do {
         if not restored_any:
             self._set_no_document_ui()
 
+    def _sessions_with_pending_pdf_changes(self) -> List[DocumentSession]:
+        return [
+            session
+            for session in self.sessions
+            if session.comments
+            or session.covers
+            or session.user_bookmarks
+            or session.saved_comment_edits
+            or session.saved_comment_removals
+        ]
+
+    def _confirm_close_with_pending_pdf_changes(self) -> bool:
+        pending = self._sessions_with_pending_pdf_changes()
+        if not pending:
+            return True
+
+        comment_count = sum(len(session.comments) for session in pending)
+        cover_count = sum(len(session.covers) for session in pending)
+        bookmark_count = sum(len(session.user_bookmarks) for session in pending)
+        edit_count = sum(len(session.saved_comment_edits) for session in pending)
+        removal_count = sum(len(session.saved_comment_removals) for session in pending)
+        document_count = len(pending)
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setWindowTitle("Unsaved PDF Changes")
+        dialog.setText(
+            f"There are pending PDF changes in {document_count} document(s): "
+            f"{comment_count} new comment(s), {edit_count} edited comment(s), "
+            f"{removal_count} removed comment(s), {cover_count} rectangle(s), "
+            f"and {bookmark_count} bookmark(s)."
+        )
+        dialog.setInformativeText("Save them into the PDF before quitting?")
+        save_button = dialog.addButton("Save Changes", QMessageBox.AcceptRole)
+        discard_button = dialog.addButton("Discard", QMessageBox.DestructiveRole)
+        cancel_button = dialog.addButton(QMessageBox.Cancel)
+        dialog.setDefaultButton(save_button)
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+        if clicked == cancel_button:
+            return False
+        if clicked == discard_button:
+            return True
+        if clicked != save_button:
+            return False
+
+        for session in list(pending):
+            if not (
+                session.comments
+                or session.covers
+                or session.user_bookmarks
+                or session.saved_comment_edits
+                or session.saved_comment_removals
+            ):
+                continue
+            try:
+                index = self.sessions.index(session)
+            except ValueError:
+                continue
+            self.doc_tabs.setCurrentIndex(index)
+            if self.current_index != index:
+                self._switch_to_document(index)
+            self.save_current_document_changes()
+            if (
+                session.comments
+                or session.covers
+                or session.user_bookmarks
+                or session.saved_comment_edits
+                or session.saved_comment_removals
+            ):
+                return False
+        return True
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        if not self._confirm_close_with_pending_pdf_changes():
+            event.ignore()
+            return
+
         self._save_session_state_now()
 
         for session in self.sessions:

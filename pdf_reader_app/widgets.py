@@ -3,7 +3,7 @@ from bisect import bisect_right
 from typing import Dict, List, Optional, Tuple
 
 import fitz
-from PySide6.QtCore import Qt, QRectF, Signal, QTimer, QPoint, QPointF, QSize, QBuffer, QIODevice, QEvent
+from PySide6.QtCore import Qt, QRect, QRectF, Signal, QTimer, QPoint, QPointF, QSize, QBuffer, QIODevice, QEvent
 from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QImage, QImageReader, QKeySequence, QPainter, QPen, QPixmap, QTextCursor, QTextDocument, QTransform
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QMenu,
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
@@ -41,10 +42,12 @@ class PdfView(QGraphicsView):
     right_clicked = Signal(int, float, float)
     link_click_requested = Signal(int, float, float)
     selection_line_requested = Signal(int, float, float)
+    selection_context_menu_requested = Signal(QPoint)
     pdf_files_dropped = Signal(list)
     hover_moved = Signal(int, float, float, QPoint)
     hover_left = Signal()
     comment_clicked = Signal(int)
+    comment_context_menu_requested = Signal(int, QPoint)
 
     def __init__(self) -> None:
         super().__init__()
@@ -70,7 +73,8 @@ class PdfView(QGraphicsView):
         self._rectangle_start_page: Optional[int] = None
         self._rectangle_scene_rect: Optional[QRectF] = None
         self._selected_learning_rect: Optional[Tuple[int, float, float, float, float]] = None
-        self._comment_overlays: List[Tuple[int, int, QRectF, str]] = []
+        self._cover_overlays: List[Tuple[int, QRectF, str]] = []
+        self._comment_overlays: List[Tuple[int, int, QRectF, str, bool]] = []
         self._hovered_comment_index: Optional[int] = None
         self._comment_hover_timer = QTimer(self)
         self._comment_hover_timer.timeout.connect(self._check_comment_hover)
@@ -89,6 +93,9 @@ class PdfView(QGraphicsView):
 
         self.horizontalScrollBar().valueChanged.connect(lambda _: self.view_changed.emit())
         self.verticalScrollBar().valueChanged.connect(lambda _: self.view_changed.emit())
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 24)
 
     def dragEnterEvent(self, event) -> None:
         if pdf_paths_from_mime_data(event.mimeData()):
@@ -156,10 +163,13 @@ class PdfView(QGraphicsView):
         self._debug_rect = None
         self._selection_line_items = []
         self._search_highlight_items = []
+        self._cover_overlays = []
         self._clear_rectangle_selection()
         self.view_changed.emit()
 
-    def set_comment_overlays(self, comments: List[PdfComment]) -> None:
+    def set_comment_overlays(self, comments: List[PdfComment], visible_count: Optional[int] = None) -> None:
+        if visible_count is None:
+            visible_count = len(comments)
         self._comment_overlays = [
             (
                 index,
@@ -171,6 +181,7 @@ class PdfView(QGraphicsView):
                     max(1.0, (comment.rect[3] - comment.rect[1]) * RENDER_SCALE),
                 ),
                 comment.color,
+                index < visible_count,
             )
             for index, comment in enumerate(comments)
         ]
@@ -195,7 +206,7 @@ class PdfView(QGraphicsView):
             return None
         page, page_x, page_y = page_pos
         point = QPointF(page_x, page_y)
-        for index, comment_page, rect, _color in self._comment_overlays:
+        for index, comment_page, rect, _color, _visible in self._comment_overlays:
             if comment_page == page and rect.contains(point):
                 return index
         return None
@@ -223,6 +234,7 @@ class PdfView(QGraphicsView):
         self._debug_rect = None
         self._selection_line_items = []
         self._search_highlight_items = []
+        self._cover_overlays = []
         self._clear_rectangle_selection()
         self.view_changed.emit()
 
@@ -267,6 +279,41 @@ class PdfView(QGraphicsView):
 
     def selected_learning_rect(self) -> Optional[Tuple[int, float, float, float, float]]:
         return self._selected_learning_rect
+
+    def _selected_scene_rect(self) -> Optional[QRectF]:
+        if self._selected_learning_rect is None:
+            return None
+        page, x0, y0, x1, y1 = self._selected_learning_rect
+        offset = self._page_offsets.get(page)
+        if offset is None:
+            return None
+        page_x, page_y, _page_w, _page_h = offset
+        return QRectF(
+            page_x + min(x0, x1),
+            page_y + min(y0, y1),
+            abs(x1 - x0),
+            abs(y1 - y0),
+        )
+
+    def _selected_rect_contains_scene_pos(self, scene_pos: QPointF) -> bool:
+        rect = self._selected_scene_rect()
+        return rect is not None and rect.contains(scene_pos)
+
+    def set_cover_overlays(self, covers: List[PdfCover]) -> None:
+        self._cover_overlays = [
+            (
+                cover.page,
+                QRectF(
+                    cover.rect[0] * RENDER_SCALE,
+                    cover.rect[1] * RENDER_SCALE,
+                    max(1.0, (cover.rect[2] - cover.rect[0]) * RENDER_SCALE),
+                    max(1.0, (cover.rect[3] - cover.rect[1]) * RENDER_SCALE),
+                ),
+                cover.color,
+            )
+            for cover in covers
+        ]
+        self.viewport().update()
 
     def _update_rectangle_selection(self, scene_pos: QPointF) -> None:
         if (
@@ -328,7 +375,23 @@ class PdfView(QGraphicsView):
         painter.setRenderHint(QPainter.Antialiasing, False)
         painter.setBrush(Qt.NoBrush)
 
-        for index, page, page_rect, color_text in self._comment_overlays:
+        for page, page_rect, color_text in self._cover_overlays:
+            scene_rect = self._comment_scene_rect(page, page_rect)
+            if scene_rect is None:
+                continue
+            top_left = self.mapFromScene(scene_rect.topLeft())
+            bottom_right = self.mapFromScene(scene_rect.bottomRight())
+            viewport_rect = QRectF(QPointF(top_left), QPointF(bottom_right)).normalized()
+            if not viewport_rect.intersects(QRectF(self.viewport().rect())):
+                continue
+            color = QColor(color_text)
+            if not color.isValid():
+                color = QColor("#FFFFFF")
+            painter.fillRect(viewport_rect, color)
+
+        for index, page, page_rect, color_text, visible in self._comment_overlays:
+            if not visible:
+                continue
             scene_rect = self._comment_scene_rect(page, page_rect)
             if scene_rect is None:
                 continue
@@ -667,11 +730,25 @@ class PdfView(QGraphicsView):
                 event.accept()
                 self.view_changed.emit()
                 return
-            # Right-click means: read the equation reference under the cursor,
+            scene_pos = self.mapToScene(event.position().toPoint())
+            comment_index = self._comment_at_scene_pos(scene_pos)
+            if comment_index is not None:
+                self.comment_context_menu_requested.emit(
+                    comment_index,
+                    self.viewport().mapToGlobal(event.position().toPoint()),
+                )
+                event.accept()
+                self.view_changed.emit()
+                return
+            if self._selected_rect_contains_scene_pos(scene_pos):
+                self.selection_context_menu_requested.emit(self.viewport().mapToGlobal(event.position().toPoint()))
+                event.accept()
+                self.view_changed.emit()
+                return
+            # Right-click elsewhere means: read the equation reference under the cursor,
             # forget its cached destination, and search again from the PDF/TOC.
             # This is useful after a bad cached hit or after switching to a PDF
             # whose bookmarks/page offsets differ.
-            scene_pos = self.mapToScene(event.position().toPoint())
             page_pos = self.page_at_scene_pos(scene_pos.x(), scene_pos.y())
             if page_pos is not None:
                 page, page_x, page_y = page_pos
@@ -1054,9 +1131,11 @@ class MacroSettingsDialog(QDialog):
 
 class DocumentBuilderList(QListWidget):
     files_dropped = Signal(list)
+    paste_image_requested = Signal(int)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self._paste_insert_index = 0
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
         self.setDropIndicatorShown(True)
@@ -1070,11 +1149,54 @@ class DocumentBuilderList(QListWidget):
         self.setIconSize(QSize(110, 150))
         self.setGridSize(QSize(150, 205))
         self.setSelectionMode(QListWidget.ExtendedSelection)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setStyleSheet(
             "QListWidget { background: #f6f7f8; border: 1px solid #cfd5dc; }"
             "QListWidget::item { padding: 8px; }"
             "QListWidget::item:selected { background: #d8e8ff; color: #111; }"
         )
+
+    def paste_insert_index(self) -> int:
+        return max(0, min(self._paste_insert_index, self.count()))
+
+    def _index_for_position(self, pos: QPoint) -> int:
+        if self.count() == 0:
+            return 0
+
+        item = self.itemAt(pos)
+        if item is not None:
+            rect = self.visualItemRect(item)
+            return self.row(item) if pos.x() < rect.center().x() else self.row(item) + 1
+
+        rects: List[Tuple[int, QRect]] = []
+        for index in range(self.count()):
+            rect = self.visualItemRect(self.item(index))
+            if not rect.isValid():
+                continue
+            rects.append((index, rect))
+        if not rects:
+            return self.count()
+
+        for index, rect in rects:
+            center = rect.center()
+            if pos.y() < center.y():
+                return index
+            if rect.top() <= pos.y() <= rect.bottom() and pos.x() < center.x():
+                return index
+        return self.count()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._paste_insert_index = self._index_for_position(event.position().toPoint())
+            self.setFocus()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.Paste):
+            self.paste_image_requested.emit(self.paste_insert_index())
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def dragEnterEvent(self, event) -> None:
         if builder_paths_from_mime_data(event.mimeData()):
@@ -1095,6 +1217,156 @@ class DocumentBuilderList(QListWidget):
             self.files_dropped.emit(paths)
             return
         super().dropEvent(event)
+
+
+class ImageCropLabel(QLabel):
+    crop_changed = Signal()
+
+    def __init__(self, image: QImage, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._image = image.convertToFormat(QImage.Format_RGB888)
+        self._crop_rect = QRect(0, 0, self._image.width(), self._image.height())
+        self._dragging = False
+        self._drag_start: Optional[QPoint] = None
+        self.setMinimumSize(520, 380)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMouseTracking(True)
+        self.setStyleSheet("background: #20242a; border: 1px solid #59616b;")
+
+    def crop_rect(self) -> QRect:
+        return QRect(self._crop_rect)
+
+    def reset_crop(self) -> None:
+        self._crop_rect = QRect(0, 0, self._image.width(), self._image.height())
+        self.update()
+        self.crop_changed.emit()
+
+    def _display_rect(self) -> QRect:
+        if self._image.isNull():
+            return QRect()
+        available = self.contentsRect().adjusted(12, 12, -12, -12)
+        if available.width() <= 0 or available.height() <= 0:
+            return QRect()
+        scaled = self._image.size()
+        scaled.scale(available.size(), Qt.KeepAspectRatio)
+        x = available.x() + (available.width() - scaled.width()) // 2
+        y = available.y() + (available.height() - scaled.height()) // 2
+        return QRect(x, y, scaled.width(), scaled.height())
+
+    def _widget_to_image_point(self, point: QPoint) -> QPoint:
+        display = self._display_rect()
+        if display.isEmpty():
+            return QPoint()
+        x_ratio = (point.x() - display.x()) / max(1, display.width())
+        y_ratio = (point.y() - display.y()) / max(1, display.height())
+        x = int(round(max(0.0, min(1.0, x_ratio)) * self._image.width()))
+        y = int(round(max(0.0, min(1.0, y_ratio)) * self._image.height()))
+        return QPoint(x, y)
+
+    def _image_to_display_rect(self, rect: QRect) -> QRect:
+        display = self._display_rect()
+        if display.isEmpty() or self._image.isNull():
+            return QRect()
+        left = display.x() + round(rect.left() / max(1, self._image.width()) * display.width())
+        top = display.y() + round(rect.top() / max(1, self._image.height()) * display.height())
+        right = display.x() + round(rect.right() / max(1, self._image.width()) * display.width())
+        bottom = display.y() + round(rect.bottom() / max(1, self._image.height()) * display.height())
+        return QRect(QPoint(left, top), QPoint(right, bottom)).normalized()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self._image.isNull():
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        display = self._display_rect()
+        painter.drawImage(display, self._image)
+
+        crop_display = self._image_to_display_rect(self._crop_rect)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 120))
+        painter.drawRect(display.x(), display.y(), display.width(), max(0, crop_display.top() - display.y()))
+        painter.drawRect(display.x(), crop_display.bottom(), display.width(), max(0, display.bottom() - crop_display.bottom() + 1))
+        painter.drawRect(display.x(), crop_display.top(), max(0, crop_display.left() - display.x()), crop_display.height())
+        painter.drawRect(crop_display.right(), crop_display.top(), max(0, display.right() - crop_display.right() + 1), crop_display.height())
+
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor("#42a5f5"), 2))
+        painter.drawRect(crop_display)
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton or not self._display_rect().contains(event.position().toPoint()):
+            super().mousePressEvent(event)
+            return
+        self._dragging = True
+        self._drag_start = self._widget_to_image_point(event.position().toPoint())
+        self._crop_rect = QRect(self._drag_start, self._drag_start)
+        self.update()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if not self._dragging or self._drag_start is None:
+            super().mouseMoveEvent(event)
+            return
+        current = self._widget_to_image_point(event.position().toPoint())
+        self._crop_rect = QRect(self._drag_start, current).normalized().intersected(
+            QRect(0, 0, self._image.width(), self._image.height())
+        )
+        self.update()
+        self.crop_changed.emit()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton or not self._dragging:
+            super().mouseReleaseEvent(event)
+            return
+        self._dragging = False
+        if self._crop_rect.width() < 2 or self._crop_rect.height() < 2:
+            self.reset_crop()
+        else:
+            self.crop_changed.emit()
+        event.accept()
+
+
+class ImageCropDialog(QDialog):
+    def __init__(self, image: QImage, title: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(900, 720)
+        self._image = image.convertToFormat(QImage.Format_RGB888)
+        self._cropped_image: Optional[QImage] = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        hint = QLabel("Drag on the page to choose the crop area.")
+        hint.setStyleSheet("color: #4b5563;")
+        layout.addWidget(hint)
+
+        self.crop_label = ImageCropLabel(self._image, self)
+        layout.addWidget(self.crop_label, 1)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText("Apply Crop")
+        reset_button = button_box.addButton("Reset", QDialogButtonBox.ResetRole)
+        reset_button.clicked.connect(self.crop_label.reset_crop)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def cropped_image(self) -> Optional[QImage]:
+        return self._cropped_image.copy() if self._cropped_image is not None else None
+
+    def accept(self) -> None:
+        rect = self.crop_label.crop_rect().intersected(QRect(0, 0, self._image.width(), self._image.height()))
+        if rect.width() < 2 or rect.height() < 2:
+            QMessageBox.information(self, "Crop Page", "Choose a larger crop area.")
+            return
+        self._cropped_image = self._image.copy(rect)
+        super().accept()
 
 
 class DocumentBuilderDialog(QDialog):
@@ -1124,13 +1396,16 @@ class DocumentBuilderDialog(QDialog):
         top_row.addWidget(remove_button)
         layout.addLayout(top_row)
 
-        instructions = QLabel("Drag PDFs or images here. Reorder pages by dragging the rectangles.")
+        instructions = QLabel("Drag PDFs or images here. Reorder pages by dragging the rectangles. Click a gap, then press Ctrl+V to paste a clipboard image there.")
         instructions.setStyleSheet("color: #4b5563;")
         layout.addWidget(instructions)
 
         self.page_list = DocumentBuilderList(self)
         self.page_list.files_dropped.connect(self.add_files)
+        self.page_list.paste_image_requested.connect(self.paste_clipboard_image)
         self.page_list.model().rowsMoved.connect(lambda *_args: QTimer.singleShot(0, self._renumber_pages))
+        self.page_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.page_list.customContextMenuRequested.connect(self.show_page_context_menu)
         layout.addWidget(self.page_list, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -1190,6 +1465,12 @@ class DocumentBuilderDialog(QDialog):
         item.setTextAlignment(Qt.AlignCenter)
         self.page_list.addItem(item)
 
+    def _insert_page_item(self, index: int, label: str, entry: dict, pixmap: QPixmap) -> None:
+        item = QListWidgetItem(QIcon(pixmap), label)
+        item.setData(Qt.UserRole, entry)
+        item.setTextAlignment(Qt.AlignCenter)
+        self.page_list.insertItem(max(0, min(index, self.page_list.count())), item)
+
     def _pdf_page_thumbnail(self, path: str, page_index: int) -> QPixmap:
         key = (path, page_index)
         if key in self._thumbnail_cache:
@@ -1241,6 +1522,110 @@ class DocumentBuilderDialog(QDialog):
             label = item.text()
             label = re.sub(r"^\d+\.\s+", "", label)
             item.setText(f"{index + 1}. {label}")
+
+    def paste_clipboard_image(self, insert_index: int) -> None:
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData()
+        image = QImage()
+
+        if mime.hasImage():
+            image_data = mime.imageData()
+            if isinstance(image_data, QImage):
+                image = image_data
+            elif isinstance(image_data, QPixmap):
+                image = image_data.toImage()
+
+        if image.isNull():
+            for url in mime.urls():
+                if not url.isLocalFile():
+                    continue
+                candidate = self._read_image(url.toLocalFile())
+                if not candidate.isNull():
+                    image = candidate
+                    break
+
+        if image.isNull():
+            QMessageBox.information(self, "Paste Image", "The clipboard does not contain an image.")
+            return
+
+        image = image.convertToFormat(QImage.Format_RGB888)
+        entry = {"kind": "clipboard_image", "image": image.copy()}
+        self._insert_page_item(insert_index, "Clipboard Image", entry, self._image_thumbnail(image))
+        self._renumber_pages()
+        pasted_item = self.page_list.item(max(0, min(insert_index, self.page_list.count() - 1)))
+        if pasted_item is not None:
+            self.page_list.setCurrentItem(pasted_item)
+
+    def show_page_context_menu(self, pos: QPoint) -> None:
+        item = self.page_list.itemAt(pos)
+        if item is None:
+            return
+        self.page_list.setCurrentItem(item)
+        menu = QMenu(self)
+        crop_action = QAction("Crop", self)
+        crop_action.triggered.connect(lambda _checked=False, page_item=item: self.crop_page_item(page_item))
+        remove_action = QAction("Remove", self)
+        remove_action.triggered.connect(self.remove_selected_pages)
+        menu.addAction(crop_action)
+        menu.addSeparator()
+        menu.addAction(remove_action)
+        menu.exec(self.page_list.viewport().mapToGlobal(pos))
+
+    def crop_page_item(self, item: QListWidgetItem) -> None:
+        entry = item.data(Qt.UserRole)
+        if not isinstance(entry, dict):
+            return
+        image = self._entry_image(entry)
+        if image.isNull():
+            QMessageBox.warning(self, "Crop Page", "Could not load this page for cropping.")
+            return
+
+        base_label = re.sub(r"^\d+\.\s+", "", item.text())
+        base_label = re.sub(r"\nCropped$", "", base_label)
+        dialog = ImageCropDialog(image, f"Crop Page {self.page_list.row(item) + 1}", self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        cropped = dialog.cropped_image()
+        if cropped is None or cropped.isNull():
+            return
+
+        cropped_entry = {
+            "kind": "cropped_image",
+            "image": cropped,
+            "source_label": base_label,
+        }
+        item.setData(Qt.UserRole, cropped_entry)
+        item.setIcon(QIcon(self._image_thumbnail(cropped)))
+        item.setText(f"{self.page_list.row(item) + 1}. {base_label}\nCropped")
+
+    def _entry_image(self, entry: dict) -> QImage:
+        kind = entry.get("kind")
+        path = str(entry.get("path", ""))
+        if kind == "pdf":
+            try:
+                doc = fitz.open(path)
+                try:
+                    page_index = int(entry.get("page_index", 0))
+                    page = doc.load_page(page_index)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(RENDER_SCALE, RENDER_SCALE), alpha=False)
+                    return QImage(
+                        pix.samples,
+                        pix.width,
+                        pix.height,
+                        pix.stride,
+                        QImage.Format_RGB888,
+                    ).copy()
+                finally:
+                    doc.close()
+            except Exception:
+                return QImage()
+        if kind == "image":
+            return self._read_image(path)
+        if kind in {"cropped_image", "clipboard_image"}:
+            image = entry.get("image")
+            return image.copy() if isinstance(image, QImage) else QImage()
+        return QImage()
 
     def remove_selected_pages(self) -> None:
         for item in self.page_list.selectedItems():
@@ -1300,6 +1685,18 @@ class DocumentBuilderDialog(QDialog):
                     export_image = image.convertToFormat(QImage.Format_RGB888)
                     if not export_image.save(buffer, "PNG") or buffer.size() == 0:
                         raise ValueError(f"Could not encode image for PDF: {path}")
+                    page.insert_image(page.rect, stream=bytes(buffer.data()))
+                elif entry.get("kind") in {"cropped_image", "clipboard_image"}:
+                    image = entry.get("image")
+                    if not isinstance(image, QImage) or image.isNull():
+                        raise ValueError("Could not read embedded page image.")
+                    page_width, page_height = self._image_page_size(image)
+                    page = out.new_page(width=page_width, height=page_height)
+                    buffer = QBuffer()
+                    buffer.open(QIODevice.WriteOnly)
+                    export_image = image.convertToFormat(QImage.Format_RGB888)
+                    if not export_image.save(buffer, "PNG") or buffer.size() == 0:
+                        raise ValueError("Could not encode embedded page for PDF.")
                     page.insert_image(page.rect, stream=bytes(buffer.data()))
             out.save(output_path)
         finally:

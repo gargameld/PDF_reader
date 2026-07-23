@@ -40,6 +40,13 @@ class PdfComment:
 
 
 @dataclass
+class PdfCover:
+    page: int
+    rect: Tuple[float, float, float, float]
+    color: str = "#FFFFFF"
+
+
+@dataclass
 class EquationLocation:
     page: int
     y: float
@@ -92,6 +99,10 @@ class DocumentSession:
     user_bookmarks: List[UserBookmark] = field(default_factory=list)
     selection_lines: List[SelectionLine] = field(default_factory=list)
     comments: List[PdfComment] = field(default_factory=list)
+    saved_pdf_comments: List[PdfComment] = field(default_factory=list)
+    saved_comment_edits: Dict[int, PdfComment] = field(default_factory=dict)
+    saved_comment_removals: set = field(default_factory=set)
+    covers: List[PdfCover] = field(default_factory=list)
     last_equation_return_state: Optional[ViewState] = None
     equation_numbering_mode: str = EQUATION_MODE_SECTION
     rendered_pages: List[Any] = field(default_factory=list)

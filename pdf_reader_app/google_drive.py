@@ -301,6 +301,31 @@ class GoogleDriveClient:
             web_view_link=str(data.get("webViewLink") or ""),
         )
 
+    def update_pdf_media(self, document_id: str, path: Path) -> CloudDocument:
+        if not document_id:
+            raise GoogleDriveError("Cannot update Google Drive without a document id.")
+        if not path.exists() or path.suffix.lower() != ".pdf":
+            raise GoogleDriveError(f"Not a PDF file: {path}")
+
+        fields = "id,name,mimeType,modifiedTime,size,thumbnailLink,webViewLink"
+        data = self._api_json_request(
+            DRIVE_UPLOAD_FILES_URL
+            + f"/{urllib.parse.quote(document_id)}?"
+            + urllib.parse.urlencode({"uploadType": "media", "fields": fields}),
+            method="PATCH",
+            data=path.read_bytes(),
+            headers={"Content-Type": "application/pdf"},
+        )
+        return CloudDocument(
+            id=str(data.get("id") or document_id),
+            name=str(data.get("name") or path.name),
+            mime_type=str(data.get("mimeType") or "application/pdf"),
+            modified_time=str(data.get("modifiedTime") or ""),
+            size=str(data.get("size") or ""),
+            thumbnail_link=str(data.get("thumbnailLink") or ""),
+            web_view_link=str(data.get("webViewLink") or ""),
+        )
+
     def thumbnail_bytes(self, document: CloudDocument) -> bytes:
         if not document.thumbnail_link:
             return b""
