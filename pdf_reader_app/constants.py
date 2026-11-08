@@ -23,6 +23,7 @@ SHORTCUT_COPY_BETWEEN_LINES_WITHOUT_EQUATIONS = "Shift+V"
 SHORTCUT_CLEAR_SELECTION_LINES = "Shift+X"
 SHORTCUT_PREVIEW_EQUATION = "Shift+P"
 SHORTCUT_OPEN_TEXT_SEARCH = "Shift+F"
+SHORTCUT_OPEN_AI_CHAT = "Shift+R"
 SHORTCUT_SPLIT_VIEWER = "Shift+W"
 SHORTCUT_CLOSE_VIEWER = "Shift+Q"
 SHORTCUT_ROTATE_VIEWER_SEGMENTS = "Shift+D"
@@ -54,6 +55,7 @@ SHORTCUT_DEFINITIONS = (
     ("clear_selection_lines", "Clear Blue Lines", SHORTCUT_CLEAR_SELECTION_LINES),
     ("preview_equation", "Preview Equation Under Cursor", SHORTCUT_PREVIEW_EQUATION),
     ("open_text_search", "Search Text", SHORTCUT_OPEN_TEXT_SEARCH),
+    ("open_ai_chat", "AI Chat", SHORTCUT_OPEN_AI_CHAT),
     ("split_viewer", "Split Viewer", SHORTCUT_SPLIT_VIEWER),
     ("close_viewer", "Close Viewer", SHORTCUT_CLOSE_VIEWER),
     ("rotate_viewer_segments", "Rotate Viewer Segments", SHORTCUT_ROTATE_VIEWER_SEGMENTS),

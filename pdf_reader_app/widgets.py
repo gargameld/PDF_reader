@@ -559,12 +559,13 @@ class PdfView(QGraphicsView):
                 best_distance = distance
         return best_page
 
-    def scroll_to_page(self, page: int, y: float = 0.0) -> None:
+    def scroll_to_page(self, page: int, y: float = 0.0, x: Optional[float] = None) -> None:
         offset = self._page_offsets.get(page)
         if offset is None:
             return
         page_x, page_y, page_w, _page_h = offset
-        target = QPointF(page_x + page_w / 2, page_y + y)
+        target_x = page_x + page_w / 2 if x is None else page_x + x
+        target = QPointF(target_x, page_y + y)
 
         # Scrollbar values are affected by the current view transform. Align
         # the requested scene point through mapFromScene so jumps stay correct

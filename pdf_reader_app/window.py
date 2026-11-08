@@ -4,15 +4,17 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import fitz
-from PySide6.QtCore import Qt, QTimer, QPoint, QUrl, QBuffer, QIODevice, QEvent, QSize
+from PySide6.QtCore import Qt, QTimer, QPoint, QUrl, QBuffer, QIODevice, QEvent, QSize, QThread, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QCursor, QDesktopServices, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QColorDialog,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDockWidget,
@@ -37,6 +39,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QTabBar,
+    QTextBrowser,
     QTextEdit,
     QToolBar,
     QTreeWidget,
@@ -45,6 +48,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .ai_document import (
+    DEFAULT_CHAT_MODELS,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_RETRIEVAL_LIMIT,
+    AIReference,
+    answer_question,
+    append_chat_history,
+    build_document_index,
+    clear_chat_history,
+    format_page_ranges,
+    has_current_index,
+    load_chat_history,
+    load_ai_settings,
+    openai_api_key,
+    save_ai_settings,
+    session_usage_totals,
+)
 from .application import PdfReaderApplication
 from .constants import *
 from .google_drive import DRIVE_FOLDER_NAME, CloudDocument, GoogleDriveClient, GoogleDriveError
@@ -182,6 +202,101 @@ class ShortcutSettingsDialog(QDialog):
         parts.append(key_name)
         return "+".join(parts)
 
+
+class AIIndexWorker(QThread):
+    progress = Signal(str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        base_dir: Path,
+        pdf_path: str,
+        api_key: str,
+        embedding_model: str,
+        page_ranges: Optional[List[Tuple[int, int]]] = None,
+    ) -> None:
+        super().__init__()
+        self.base_dir = base_dir
+        self.pdf_path = pdf_path
+        self.api_key = api_key
+        self.embedding_model = embedding_model
+        self.page_ranges = page_ranges
+
+    def run(self) -> None:
+        try:
+            result = build_document_index(
+                self.base_dir,
+                self.pdf_path,
+                self.api_key,
+                self.embedding_model,
+                page_ranges=self.page_ranges,
+                progress=self.progress.emit,
+            )
+            self.completed.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AIQuestionWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        base_dir: Path,
+        pdf_path: str,
+        api_key: str,
+        question: str,
+        chat_model: str,
+        embedding_model: str,
+        page_ranges: Optional[List[Tuple[int, int]]] = None,
+        retrieval_limit: int = DEFAULT_RETRIEVAL_LIMIT,
+    ) -> None:
+        super().__init__()
+        self.base_dir = base_dir
+        self.pdf_path = pdf_path
+        self.api_key = api_key
+        self.question = question
+        self.chat_model = chat_model
+        self.embedding_model = embedding_model
+        self.page_ranges = page_ranges
+        self.retrieval_limit = retrieval_limit
+
+    def run(self) -> None:
+        try:
+            answer, references = answer_question(
+                self.base_dir,
+                self.pdf_path,
+                self.api_key,
+                self.question,
+                self.chat_model,
+                self.embedding_model,
+                page_ranges=self.page_ranges,
+                retrieval_limit=self.retrieval_limit,
+            )
+            self.completed.emit(
+                {
+                    "question": self.question,
+                    "answer": answer,
+                    "references": {
+                        label: {
+                            "page": ref.page,
+                            "x": ref.x,
+                            "y": ref.y,
+                            "rect": list(ref.rect),
+                            "text": ref.text,
+                        }
+                        for label, ref in references.items()
+                    },
+                    "page_ranges": format_page_ranges(self.page_ranges),
+                    "retrieval_limit": self.retrieval_limit,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class PdfReaderWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -211,6 +326,11 @@ class PdfReaderWindow(QMainWindow):
             self.cloud_cache_dir,
             self.base_dir / "google_oauth_client.json",
         )
+        self.ai_settings = load_ai_settings(self.base_dir)
+        self._ai_threads: List[QThread] = []
+        self._ai_message_counter = 0
+        self.ai_reference_map: Dict[str, AIReference] = {}
+        self._ai_history_document_path: Optional[str] = None
         self._layout_independent_shortcuts: List[Tuple[QAction, Qt.KeyboardModifiers, str]] = []
         self._shortcut_actions: Dict[str, QAction] = {}
         self._shortcut_defaults: Dict[str, str] = {
@@ -348,6 +468,110 @@ class PdfReaderWindow(QMainWindow):
         self.search_dock.visibilityChanged.connect(self._text_search_visibility_changed)
         self.addDockWidget(Qt.RightDockWidgetArea, self.search_dock)
         self.search_dock.hide()
+
+        self.ai_api_key_input = QLineEdit()
+        self.ai_api_key_input.setEchoMode(QLineEdit.Password)
+        saved_api_key = str(self.ai_settings.get("api_key") or "")
+        if saved_api_key:
+            self.ai_api_key_input.setText(saved_api_key)
+        elif openai_api_key(self.base_dir):
+            self.ai_api_key_input.setPlaceholderText("Using OPENAI_API_KEY")
+        else:
+            self.ai_api_key_input.setPlaceholderText("OpenAI API key")
+        self.ai_save_key_button = QPushButton("Save Key")
+        self.ai_save_key_button.clicked.connect(self.save_ai_api_key)
+
+        self.ai_model_combo = QComboBox()
+        self.ai_model_combo.setEditable(True)
+        selected_model = str(self.ai_settings.get("chat_model") or "").strip()
+        if not selected_model or selected_model == "gpt-5.6-terra":
+            selected_model = DEFAULT_CHAT_MODELS[0]
+        model_values = list(DEFAULT_CHAT_MODELS)
+        if selected_model and selected_model not in model_values:
+            model_values.insert(0, selected_model)
+        self.ai_model_combo.addItems(model_values)
+        self.ai_model_combo.setCurrentText(selected_model)
+
+        self.ai_page_ranges_input = QLineEdit()
+        self.ai_page_ranges_input.setPlaceholderText("Pages to scan, e.g. 1-20, 45, 70-90; blank = all")
+        self.ai_scan_button = QPushButton("Scan Document")
+        self.ai_scan_button.clicked.connect(self.start_ai_document_scan)
+        self.ai_clear_history_button = QPushButton("Clear History")
+        self.ai_clear_history_button.clicked.connect(self.clear_ai_history)
+        self.ai_status_label = QLabel("Enter an API key, then scan the current document.")
+        self.ai_status_label.setWordWrap(True)
+        self.ai_cost_label = QLabel("")
+        self.ai_cost_label.setWordWrap(True)
+
+        self.ai_chat_view = QTextBrowser()
+        self.ai_chat_view.setOpenLinks(False)
+        self.ai_chat_view.anchorClicked.connect(self.open_ai_reference)
+        self.ai_chat_view.setMinimumHeight(240)
+        self.ai_chat_view.document().setDefaultStyleSheet(
+            ".ai-math-inline { "
+            "font-family: 'STIX Two Math', 'Cambria Math', 'Times New Roman', serif; "
+            "white-space: nowrap; color: #EDEDED; background: rgba(255,255,255,0.08); "
+            "padding: 0 3px; border-radius: 3px; "
+            "}"
+            ".ai-math-block { "
+            "font-family: 'STIX Two Math', 'Cambria Math', 'Times New Roman', serif; "
+            "white-space: pre-wrap; color: #EDEDED; background: rgba(255,255,255,0.06); "
+            "margin: 6px 0; padding: 6px; border-left: 3px solid #1976D2; "
+            "}"
+            "a { color: #42A5F5; text-decoration: none; }"
+            "a:hover { text-decoration: underline; }"
+        )
+
+        self.ai_question_input = QPlainTextEdit()
+        self.ai_question_input.setPlaceholderText("Ask about the current document")
+        self.ai_question_input.setMaximumHeight(96)
+        self.ai_bookmark_scope_combo = QComboBox()
+        self.ai_bookmark_scope_combo.currentIndexChanged.connect(self._ai_bookmark_scope_changed)
+        self.ai_question_ranges_input = QLineEdit()
+        self.ai_question_ranges_input.setPlaceholderText("Pages for this question, e.g. 120-150; blank = all scanned pages")
+        self.ai_question_ranges_input.textEdited.connect(self._ai_question_range_text_edited)
+        self.ai_chunk_limit_spin = QSpinBox()
+        self.ai_chunk_limit_spin.setRange(1, 60)
+        self.ai_chunk_limit_spin.setValue(
+            max(1, min(60, int(self.ai_settings.get("retrieval_limit") or DEFAULT_RETRIEVAL_LIMIT)))
+        )
+        self.ai_ask_button = QPushButton("Ask")
+        self.ai_ask_button.clicked.connect(self.ask_ai_question)
+
+        ai_panel = QWidget()
+        ai_layout = QVBoxLayout(ai_panel)
+        key_row = QHBoxLayout()
+        key_row.addWidget(self.ai_api_key_input, 1)
+        key_row.addWidget(self.ai_save_key_button)
+        ai_layout.addLayout(key_row)
+        ai_layout.addWidget(QLabel("Model"))
+        ai_layout.addWidget(self.ai_model_combo)
+        ai_layout.addWidget(self.ai_page_ranges_input)
+        ai_buttons_row = QHBoxLayout()
+        ai_buttons_row.addWidget(self.ai_scan_button)
+        ai_buttons_row.addWidget(self.ai_clear_history_button)
+        ai_layout.addLayout(ai_buttons_row)
+        ai_layout.addWidget(self.ai_status_label)
+        ai_layout.addWidget(self.ai_cost_label)
+        ai_layout.addWidget(self.ai_chat_view, 1)
+        ai_layout.addWidget(QLabel("Ask within"))
+        ai_layout.addWidget(self.ai_bookmark_scope_combo)
+        ai_layout.addWidget(self.ai_question_ranges_input)
+        chunk_row = QHBoxLayout()
+        chunk_row.addWidget(QLabel("Chunks to use"))
+        chunk_row.addWidget(self.ai_chunk_limit_spin)
+        chunk_row.addStretch()
+        ai_layout.addLayout(chunk_row)
+        ai_layout.addWidget(self.ai_question_input)
+        ai_layout.addWidget(self.ai_ask_button)
+
+        self.ai_dock = QDockWidget("AI Chat", self)
+        self.ai_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+        self.ai_dock.setMinimumWidth(320)
+        self.ai_dock.setWidget(ai_panel)
+        self.ai_dock.visibilityChanged.connect(self._ai_chat_visibility_changed)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.ai_dock)
+        self.ai_dock.hide()
 
         self._text_search_timer = QTimer(self)
         self._text_search_timer.timeout.connect(self._scan_text_search_chunk)
@@ -1959,6 +2183,12 @@ class PdfReaderWindow(QMainWindow):
             self.open_text_search,
             "open_text_search",
         )
+        self.open_ai_chat_action = self._create_action(
+            "AI Chat",
+            SHORTCUT_OPEN_AI_CHAT,
+            self.open_ai_chat,
+            "open_ai_chat",
+        )
         self.split_viewer_action = self._create_action(
             "Split Viewer",
             SHORTCUT_SPLIT_VIEWER,
@@ -2037,6 +2267,7 @@ class PdfReaderWindow(QMainWindow):
         toolbar.addAction(self.toggle_bookmarks_action)
         toolbar.addAction(self.add_bookmark_action)
         toolbar.addAction(self.open_text_search_action)
+        toolbar.addAction(self.open_ai_chat_action)
         toolbar.addAction(self.scan_equation_index_action)
         toolbar.addAction(self.learn_equation_rectangle_action)
         toolbar.addAction(self.create_comment_action)
@@ -2616,6 +2847,11 @@ class PdfReaderWindow(QMainWindow):
         self.search_input.clear()
         self.search_count_label.setText("0/0")
         self.search_status_label.setText("")
+        if hasattr(self, "ai_status_label"):
+            self._ai_history_document_path = None
+            self.ai_reference_map.clear()
+            self.ai_chat_view.clear()
+            self._sync_ai_panel()
         if hasattr(self, "central_stack"):
             self._refresh_menu_documents()
             self.central_stack.setCurrentIndex(1)
@@ -2788,6 +3024,914 @@ class PdfReaderWindow(QMainWindow):
             return
         self.status_label.setText(f"Page {session.current_page} / {len(session.doc)}")
         self.zoom_label.setText(f"{round(self.view.zoom_factor() * 100)}%")
+
+    def open_ai_chat(self) -> None:
+        session = self.current_session()
+        state = self._current_view_state() if session is not None else None
+        self.ai_dock.show()
+        self.ai_dock.raise_()
+        self._sync_ai_panel()
+        if not self._current_ai_api_key():
+            self.ai_api_key_input.setFocus()
+        else:
+            self.ai_question_input.setFocus()
+        if session is not None and state is not None:
+            QTimer.singleShot(0, lambda s=session, st=state: self._restore_ai_chat_open_state(s, st))
+            QTimer.singleShot(60, lambda s=session, st=state: self._restore_ai_chat_open_state(s, st))
+
+    def _restore_ai_chat_open_state(self, session: DocumentSession, state: ViewState) -> None:
+        if session is not self.current_session():
+            return
+        focus_key = not self._current_ai_api_key()
+        self._suspend_history = True
+        try:
+            self.view.set_zoom_factor(state.zoom)
+            self.view.horizontalScrollBar().setValue(
+                max(0, min(state.scroll_x, self.view.horizontalScrollBar().maximum()))
+            )
+            self.view.verticalScrollBar().setValue(
+                max(0, min(state.scroll_y, self.view.verticalScrollBar().maximum()))
+            )
+            session.current_page = state.page
+            session.saved_view_state = state
+            self.page_input.blockSignals(True)
+            self.page_input.setValue(state.page)
+            self.page_input.blockSignals(False)
+            self._ensure_rendered_visible_pages(session, self.view)
+            self._update_status()
+        finally:
+            self._suspend_history = False
+        if focus_key:
+            self.ai_api_key_input.setFocus()
+        else:
+            self.ai_question_input.setFocus()
+
+    def _ai_chat_visibility_changed(self, visible: bool) -> None:
+        if visible:
+            self._sync_ai_panel()
+
+    def _current_ai_api_key(self) -> str:
+        typed = self.ai_api_key_input.text().strip() if hasattr(self, "ai_api_key_input") else ""
+        if typed:
+            return typed
+        return openai_api_key(self.base_dir)
+
+    def _current_ai_model(self) -> str:
+        return self.ai_model_combo.currentText().strip() or DEFAULT_CHAT_MODELS[0]
+
+    def _current_embedding_model(self) -> str:
+        return str(self.ai_settings.get("embedding_model") or DEFAULT_EMBEDDING_MODEL).strip() or DEFAULT_EMBEDDING_MODEL
+
+    def _refresh_ai_bookmark_scope_combo(self) -> None:
+        if not hasattr(self, "ai_bookmark_scope_combo"):
+            return
+
+        current_range = self.ai_question_ranges_input.text().strip()
+        previous_data = self.ai_bookmark_scope_combo.currentData()
+        session = self.current_session()
+        items: List[Tuple[str, str]] = [("All scanned pages", ""), ("Manual page range", "__manual__")]
+
+        if session is not None:
+            items.extend(self._ai_bookmark_scope_items(session))
+
+        self.ai_bookmark_scope_combo.blockSignals(True)
+        try:
+            self.ai_bookmark_scope_combo.clear()
+            for label, value in items:
+                self.ai_bookmark_scope_combo.addItem(label, value)
+
+            target_index = 0
+            if current_range:
+                for index in range(self.ai_bookmark_scope_combo.count()):
+                    if self.ai_bookmark_scope_combo.itemData(index) == current_range:
+                        target_index = index
+                        break
+                else:
+                    target_index = 1
+            elif previous_data == "__manual__":
+                target_index = 1
+            self.ai_bookmark_scope_combo.setCurrentIndex(target_index)
+        finally:
+            self.ai_bookmark_scope_combo.blockSignals(False)
+
+    def _ai_bookmark_scope_items(self, session: DocumentSession) -> List[Tuple[str, str]]:
+        toc = self._get_pdf_toc(session)
+        out: List[Tuple[str, str]] = []
+        page_count = len(session.doc)
+
+        normalized: List[Tuple[int, str, int]] = []
+        for entry in toc:
+            if len(entry) < 3:
+                continue
+            try:
+                level = max(1, int(entry[0]))
+                title = str(entry[1]).strip() or "Untitled bookmark"
+                page = max(1, min(int(entry[2]), page_count))
+            except Exception:
+                continue
+            normalized.append((level, title, page))
+
+        for index, (level, title, start_page) in enumerate(normalized):
+            end_page = page_count
+            for next_level, _next_title, next_page in normalized[index + 1 :]:
+                if next_level <= level:
+                    end_page = max(start_page, next_page - 1)
+                    break
+            page_range = str(start_page) if start_page == end_page else f"{start_page}-{end_page}"
+            indent = "  " * min(level - 1, 5)
+            out.append((f"{indent}{title} (p. {page_range})", page_range))
+
+        for bookmark in session.user_bookmarks:
+            page = max(1, min(int(bookmark.page), page_count))
+            title = str(bookmark.title).strip() or "Bookmark"
+            out.append((f"Added: {title} (p. {page})", str(page)))
+        return out
+
+    def _ai_bookmark_scope_changed(self, _index: int) -> None:
+        if not hasattr(self, "ai_bookmark_scope_combo"):
+            return
+        value = self.ai_bookmark_scope_combo.currentData()
+        if value == "__manual__":
+            self.ai_question_ranges_input.setFocus()
+            return
+        self.ai_question_ranges_input.blockSignals(True)
+        try:
+            self.ai_question_ranges_input.setText(str(value or ""))
+        finally:
+            self.ai_question_ranges_input.blockSignals(False)
+        if value:
+            self.statusBar().showMessage(f"AI question scope set to pages {value}", 3000)
+        else:
+            self.statusBar().showMessage("AI question scope set to all scanned pages", 3000)
+
+    def _ai_question_range_text_edited(self, _text: str) -> None:
+        if not hasattr(self, "ai_bookmark_scope_combo"):
+            return
+        manual_index = self.ai_bookmark_scope_combo.findData("__manual__")
+        if manual_index >= 0 and self.ai_bookmark_scope_combo.currentIndex() != manual_index:
+            self.ai_bookmark_scope_combo.blockSignals(True)
+            try:
+                self.ai_bookmark_scope_combo.setCurrentIndex(manual_index)
+            finally:
+                self.ai_bookmark_scope_combo.blockSignals(False)
+
+    def save_ai_api_key(self) -> None:
+        api_key = self.ai_api_key_input.text().strip()
+        if not api_key:
+            self.statusBar().showMessage("Enter an API key before saving", 4000)
+            self.ai_api_key_input.setFocus()
+            return
+        self.ai_settings.update(
+            {
+                "api_key": api_key,
+                "chat_model": self._current_ai_model(),
+                "embedding_model": self._current_embedding_model(),
+                "retrieval_limit": self.ai_chunk_limit_spin.value(),
+            }
+        )
+        try:
+            save_ai_settings(self.base_dir, self.ai_settings)
+        except Exception as exc:
+            QMessageBox.warning(self, "AI Chat", f"Could not save API key:\n{exc}")
+            return
+        self._sync_ai_panel()
+        self.statusBar().showMessage("Saved OpenAI API key locally", 5000)
+
+    def _sync_ai_panel(self) -> None:
+        if not hasattr(self, "ai_status_label"):
+            return
+        self._sync_ai_cost_label()
+        self._refresh_ai_bookmark_scope_combo()
+        session = self.current_session()
+        if session is None:
+            if self._current_ai_api_key():
+                self.ai_status_label.setText("Open a PDF, then scan it before asking questions.")
+            else:
+                self.ai_status_label.setText("Enter and save an OpenAI API key, then open a PDF.")
+            self.ai_scan_button.setEnabled(False)
+            self.ai_ask_button.setEnabled(False)
+            self.ai_clear_history_button.setEnabled(False)
+            self.ai_bookmark_scope_combo.setEnabled(False)
+            return
+
+        has_key = bool(self._current_ai_api_key())
+        embedding_model = self._current_embedding_model()
+        has_index = has_current_index(self.base_dir, session.path, embedding_model)
+        self.ai_scan_button.setEnabled(has_key)
+        self.ai_ask_button.setEnabled(has_key and has_index)
+        self.ai_clear_history_button.setEnabled(True)
+        self.ai_bookmark_scope_combo.setEnabled(True)
+        self._load_ai_history_for_session(session)
+        if not has_key:
+            self.ai_status_label.setText("Enter and save an OpenAI API key first.")
+        elif has_index:
+            self.ai_status_label.setText("This document is scanned. Ask a question or rescan after PDF changes.")
+        else:
+            self.ai_status_label.setText("Scan this document before asking questions.")
+
+    def _sync_ai_cost_label(self) -> None:
+        if not hasattr(self, "ai_cost_label"):
+            return
+        usage = session_usage_totals()
+        self.ai_cost_label.setText(
+            "Cost since app open: "
+            f"${usage.total_usd:.4f} "
+            f"({usage.request_count} API request{'s' if usage.request_count != 1 else ''}, "
+            f"{usage.input_tokens:,} input tokens, {usage.output_tokens:,} output tokens)"
+        )
+
+    def start_ai_document_scan(self) -> None:
+        session = self.current_session()
+        if session is None:
+            self.statusBar().showMessage("Open a PDF before scanning", 4000)
+            return
+        api_key = self._current_ai_api_key()
+        if not api_key:
+            self.ai_api_key_input.setFocus()
+            self.statusBar().showMessage("Enter an OpenAI API key first", 5000)
+            return
+        self.ai_settings.update(
+            {
+                "api_key": api_key,
+                "chat_model": self._current_ai_model(),
+                "embedding_model": self._current_embedding_model(),
+                "retrieval_limit": self.ai_chunk_limit_spin.value(),
+            }
+        )
+        try:
+            save_ai_settings(self.base_dir, self.ai_settings)
+        except Exception:
+            pass
+
+        try:
+            page_ranges = self._parse_ai_page_ranges(self.ai_page_ranges_input.text(), len(session.doc))
+        except ValueError as exc:
+            QMessageBox.warning(self, "AI Scan Pages", str(exc))
+            self.ai_page_ranges_input.setFocus()
+            return
+
+        range_label = format_page_ranges(page_ranges)
+
+        self.ai_scan_button.setEnabled(False)
+        self.ai_ask_button.setEnabled(False)
+        if range_label:
+            self.ai_status_label.setText(f"Starting AI scan for pages {range_label}...")
+            self.statusBar().showMessage(f"Scanning pages {range_label} for AI chunks...", 0)
+        else:
+            self.ai_status_label.setText("Starting full AI scan...")
+            self.statusBar().showMessage("Scanning full document for AI chunks...", 0)
+        worker = AIIndexWorker(self.base_dir, session.path, api_key, self._current_embedding_model(), page_ranges)
+        worker.progress.connect(self._ai_scan_progress)
+        worker.completed.connect(self._ai_scan_completed)
+        worker.failed.connect(self._ai_scan_failed)
+        worker.finished.connect(lambda w=worker: self._ai_worker_finished(w))
+        self._ai_threads.append(worker)
+        worker.start()
+
+    @staticmethod
+    def _parse_ai_page_ranges(text: str, total_pages: int) -> Optional[List[Tuple[int, int]]]:
+        raw = text.strip()
+        if not raw:
+            return None
+
+        ranges: List[Tuple[int, int]] = []
+        for part in re.split(r"[,;]\s*", raw):
+            token = part.strip()
+            if not token:
+                continue
+            match = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", token)
+            if not match:
+                raise ValueError(
+                    "Use page ranges like 1-20, 45, 70-90. Leave the field blank to scan the whole document."
+                )
+            start = int(match.group(1))
+            end = int(match.group(2) or start)
+            if start < 1 or end < 1:
+                raise ValueError("Page numbers must be 1 or higher.")
+            if start > total_pages or end > total_pages:
+                raise ValueError(f"Page range {token} is outside this document. It has {total_pages} page(s).")
+            ranges.append((min(start, end), max(start, end)))
+
+        if not ranges:
+            return None
+        ranges.sort()
+        merged: List[Tuple[int, int]] = []
+        for start, end in ranges:
+            if not merged or start > merged[-1][1] + 1:
+                merged.append((start, end))
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        return merged
+
+    def _ai_scan_progress(self, message: str) -> None:
+        self._sync_ai_cost_label()
+        self.ai_status_label.setText(message)
+        self.statusBar().showMessage(message, 0)
+
+    def _ai_scan_completed(self, result: object) -> None:
+        self._sync_ai_cost_label()
+        data = result if isinstance(result, dict) else {}
+        chunk_count = int(data.get("chunk_count") or 0)
+        added_chunk_count = int(data.get("added_chunk_count") or chunk_count)
+        page_count = int(data.get("page_count") or 0)
+        text_page_count = int(data.get("text_page_count") or 0)
+        scanned_text_page_count = int(data.get("scanned_text_page_count") or text_page_count)
+        range_label = str(data.get("page_ranges") or "")
+        if range_label:
+            self.ai_status_label.setText(
+                f"Added pages {range_label}: {added_chunk_count} new chunk(s) from "
+                f"{scanned_text_page_count} page(s). Index now has {chunk_count} chunk(s) "
+                f"from {text_page_count} / {page_count} page(s) with extractable text."
+            )
+        else:
+            self.ai_status_label.setText(
+                f"Scanned {chunk_count} chunk(s) from {text_page_count} / {page_count} page(s) with extractable text."
+            )
+        self.statusBar().showMessage(f"AI scan complete: {chunk_count} chunk(s)", 6000)
+        self._sync_ai_panel()
+
+    def _ai_scan_failed(self, message: str) -> None:
+        self._sync_ai_cost_label()
+        self.ai_status_label.setText(f"AI scan failed: {message}")
+        self.statusBar().showMessage("AI scan failed", 6000)
+        QMessageBox.warning(self, "AI Scan", message)
+        self._sync_ai_panel()
+
+    def ask_ai_question(self) -> None:
+        session = self.current_session()
+        if session is None:
+            self.statusBar().showMessage("Open a PDF before asking AI", 4000)
+            return
+        api_key = self._current_ai_api_key()
+        if not api_key:
+            self.ai_api_key_input.setFocus()
+            self.statusBar().showMessage("Enter an OpenAI API key first", 5000)
+            return
+        embedding_model = self._current_embedding_model()
+        if not has_current_index(self.base_dir, session.path, embedding_model):
+            self.statusBar().showMessage("Scan this document before asking questions", 5000)
+            self.ai_status_label.setText("Scan this document before asking questions.")
+            return
+        question = self.ai_question_input.toPlainText().strip()
+        if not question:
+            self.ai_question_input.setFocus()
+            return
+        try:
+            question_page_ranges = self._parse_ai_page_ranges(self.ai_question_ranges_input.text(), len(session.doc))
+        except ValueError as exc:
+            QMessageBox.warning(self, "AI Question Pages", str(exc))
+            self.ai_question_ranges_input.setFocus()
+            return
+
+        chat_model = self._current_ai_model()
+        self.ai_settings.update(
+            {
+                "api_key": api_key,
+                "chat_model": chat_model,
+                "embedding_model": embedding_model,
+                "retrieval_limit": self.ai_chunk_limit_spin.value(),
+            }
+        )
+        try:
+            save_ai_settings(self.base_dir, self.ai_settings)
+        except Exception:
+            pass
+
+        self.ai_question_input.clear()
+        self.ai_ask_button.setEnabled(False)
+        self.ai_scan_button.setEnabled(False)
+        question_range_label = format_page_ranges(question_page_ranges)
+        if question_range_label:
+            self.ai_status_label.setText(f"Asking {chat_model} using pages {question_range_label}...")
+            self.statusBar().showMessage(f"Asking {chat_model} using pages {question_range_label}...", 0)
+        else:
+            self.ai_status_label.setText(f"Asking {chat_model}...")
+            self.statusBar().showMessage(f"Asking {chat_model}...", 0)
+        worker = AIQuestionWorker(
+            self.base_dir,
+            session.path,
+            api_key,
+            question,
+            chat_model,
+            embedding_model,
+            question_page_ranges,
+            self.ai_chunk_limit_spin.value(),
+        )
+        worker.completed.connect(self._ai_question_completed)
+        worker.failed.connect(self._ai_question_failed)
+        worker.finished.connect(lambda w=worker: self._ai_worker_finished(w))
+        self._ai_threads.append(worker)
+        worker.start()
+
+    def _ai_question_completed(self, result: object) -> None:
+        self._sync_ai_cost_label()
+        data = result if isinstance(result, dict) else {}
+        question = str(data.get("question") or "")
+        answer = str(data.get("answer") or "")
+        page_ranges = str(data.get("page_ranges") or "")
+        retrieval_limit = int(data.get("retrieval_limit") or self.ai_chunk_limit_spin.value())
+        references = self._coerce_ai_references(data.get("references"))
+        self._append_ai_exchange(question, answer, references, page_ranges=page_ranges, retrieval_limit=retrieval_limit)
+        self.ai_status_label.setText("Answer ready. Click page references to jump in the PDF.")
+        self.statusBar().showMessage("AI answer ready", 5000)
+        self._sync_ai_panel()
+
+    def _ai_question_failed(self, message: str) -> None:
+        self._sync_ai_cost_label()
+        self.ai_status_label.setText(f"AI question failed: {message}")
+        self.statusBar().showMessage("AI question failed", 6000)
+        QMessageBox.warning(self, "AI Chat", message)
+        self._sync_ai_panel()
+
+    def _ai_worker_finished(self, worker: QThread) -> None:
+        if worker in self._ai_threads:
+            self._ai_threads.remove(worker)
+        worker.deleteLater()
+
+    def _load_ai_history_for_session(self, session: DocumentSession, force: bool = False) -> None:
+        if not hasattr(self, "ai_chat_view"):
+            return
+        if not force and self._ai_history_document_path == session.path:
+            return
+        self._ai_history_document_path = session.path
+        self.ai_reference_map.clear()
+        self.ai_chat_view.clear()
+        self._ai_message_counter = 0
+        for entry in load_chat_history(self.base_dir, session.path):
+            question = str(entry.get("question") or "")
+            answer = str(entry.get("answer") or "")
+            model = str(entry.get("model") or self._current_ai_model())
+            created_at = int(entry.get("created_at") or 0)
+            page_ranges = str(entry.get("page_ranges") or "")
+            retrieval_limit = int(entry.get("retrieval_limit") or 0)
+            references = self._deserialize_ai_references(entry.get("references", {}))
+            if question or answer:
+                self._append_ai_exchange(
+                    question,
+                    answer,
+                    references,
+                    save_history=False,
+                    model=model,
+                    created_at=created_at,
+                    page_ranges=page_ranges,
+                    retrieval_limit=retrieval_limit,
+                )
+
+    def clear_ai_history(self) -> None:
+        session = self.current_session()
+        if session is None:
+            return
+        result = QMessageBox.question(
+            self,
+            "Clear AI History",
+            f"Clear AI question history for {self._session_display_name(session.path)}?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if result != QMessageBox.Yes:
+            return
+        clear_chat_history(self.base_dir, session.path)
+        self._load_ai_history_for_session(session, force=True)
+        self.statusBar().showMessage("Cleared AI history for this document", 5000)
+
+    def _append_ai_exchange(
+        self,
+        question: str,
+        answer: str,
+        references: Dict[str, AIReference],
+        save_history: bool = True,
+        model: Optional[str] = None,
+        created_at: int = 0,
+        page_ranges: str = "",
+        retrieval_limit: int = 0,
+    ) -> None:
+        self._ai_message_counter += 1
+        message_id = f"m{self._ai_message_counter}"
+        question_html = self._plain_text_to_html(question)
+        answer_html = self._answer_to_html(answer, message_id, references)
+        model_name = model or self._current_ai_model()
+        time_html = ""
+        if created_at:
+            try:
+                time_html = f" <span style='color:#777777;'>({time.strftime('%Y-%m-%d %H:%M', time.localtime(created_at))})</span>"
+            except Exception:
+                time_html = ""
+        scope_html = f"<br><span style='color:#777777;'>Pages: {html.escape(page_ranges)}</span>" if page_ranges else ""
+        chunks_html = (
+            f"<br><span style='color:#777777;'>Chunks requested: {retrieval_limit}</span>"
+            if retrieval_limit
+            else ""
+        )
+        self.ai_chat_view.append(
+            "<div style='margin: 8px 0;'>"
+            "<b>You</b><br>"
+            f"{question_html}"
+            f"{scope_html}"
+            f"{chunks_html}"
+            "</div>"
+            "<div style='margin: 10px 0 16px 0;'>"
+            f"<b>AI ({html.escape(model_name)})</b>{time_html}<br>"
+            f"{answer_html}"
+            "</div>"
+        )
+        self.ai_chat_view.verticalScrollBar().setValue(self.ai_chat_view.verticalScrollBar().maximum())
+        if save_history:
+            session = self.current_session()
+            if session is not None:
+                append_chat_history(
+                    self.base_dir,
+                    session.path,
+                    {
+                        "created_at": int(time.time()),
+                        "model": model_name,
+                        "question": question,
+                        "answer": answer,
+                        "page_ranges": page_ranges,
+                        "retrieval_limit": retrieval_limit,
+                        "references": self._serialize_ai_references(references),
+                    },
+                )
+
+    @staticmethod
+    def _serialize_ai_references(references: Dict[str, AIReference]) -> Dict[str, dict]:
+        return {
+            label: {
+                "page": ref.page,
+                "x": ref.x,
+                "y": ref.y,
+                "rect": list(ref.rect),
+                "text": ref.text,
+            }
+            for label, ref in references.items()
+        }
+
+    @staticmethod
+    def _deserialize_ai_references(raw: object) -> Dict[str, AIReference]:
+        return PdfReaderWindow._coerce_ai_references(raw)
+
+    @staticmethod
+    def _coerce_ai_references(raw: object) -> Dict[str, AIReference]:
+        if not isinstance(raw, dict):
+            return {}
+        references: Dict[str, AIReference] = {}
+        for label, value in raw.items():
+            if isinstance(value, AIReference):
+                references[str(label)] = value
+                continue
+            if not isinstance(value, dict):
+                continue
+            try:
+                references[str(label)] = AIReference(
+                    page=max(1, int(value.get("page") or 1)),
+                    x=max(0.0, float(value.get("x") or 0.0)),
+                    y=max(0.0, float(value.get("y") or 0.0)),
+                    rect=PdfReaderWindow._deserialize_ai_reference_rect(value.get("rect")),
+                    text=str(value.get("text") or ""),
+                )
+            except Exception:
+                continue
+        return references
+
+    @staticmethod
+    def _deserialize_ai_reference_rect(raw: object) -> Tuple[float, float, float, float]:
+        if isinstance(raw, list) and len(raw) >= 4:
+            try:
+                return (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+            except Exception:
+                pass
+        return (0.0, 0.0, 0.0, 0.0)
+
+    def _answer_to_html(self, answer: str, message_id: str, references: Dict[str, AIReference]) -> str:
+        escaped = self._ai_text_to_html(answer)
+        cited_labels = set()
+
+        def replace_citation(match) -> str:
+            label = match.group(1)
+            ref = references.get(label)
+            if ref is None:
+                cited_labels.add(label)
+                return (
+                    "<span style='color:#FFB74D;' "
+                    f"title='No retrieved source was available for {html.escape(label)}'>"
+                    f"[missing {html.escape(label)}]</span>"
+                )
+            anchor_id = f"{message_id}:{label}"
+            self.ai_reference_map[anchor_id] = ref
+            cited_labels.add(label)
+            return self._ai_reference_anchor(anchor_id, ref)
+
+        escaped = re.sub(r"\[\[\s*(C\d+)\s*\]\]", replace_citation, escaped)
+        if references:
+            links = []
+            for label, ref in references.items():
+                anchor_id = f"{message_id}:{label}"
+                self.ai_reference_map[anchor_id] = ref
+                prefix = f"{html.escape(label)}: "
+                links.append(prefix + self._ai_reference_anchor(anchor_id, ref, include_coordinates=True))
+            if links:
+                escaped += "<br><br><b>Retrieved sources:</b> " + ", ".join(links)
+        elif cited_labels:
+            escaped += (
+                "<br><br><span style='color:#FFB74D;'>"
+                "This saved answer has citation labels but no stored source coordinates. Ask again to create clickable references."
+                "</span>"
+            )
+        return escaped
+
+    @staticmethod
+    def _ai_reference_anchor(anchor_id: str, ref: AIReference, include_coordinates: bool = False) -> str:
+        return (
+            f"<a href='ai-cite:{html.escape(anchor_id)}' "
+            f"title='{html.escape(PdfReaderWindow._ai_reference_tooltip(ref))}'>"
+            f"{html.escape(PdfReaderWindow._ai_reference_link_text(ref, include_coordinates=include_coordinates))}</a>"
+        )
+
+    @staticmethod
+    def _ai_reference_link_text(ref: AIReference, include_coordinates: bool = False) -> str:
+        x = ref.x
+        y = ref.y
+        if ref.rect and len(ref.rect) >= 4 and (float(ref.rect[2]) > float(ref.rect[0]) or float(ref.rect[3]) > float(ref.rect[1])):
+            x = float(ref.rect[0])
+            y = float(ref.rect[1])
+        if include_coordinates and (x > 0 or y > 0):
+            return f"[p. {ref.page}, x {x:.0f}, y {y:.0f}]"
+        return f"[p. {ref.page}]"
+
+    @staticmethod
+    def _ai_reference_tooltip(ref: AIReference) -> str:
+        x = ref.x
+        y = ref.y
+        if ref.rect and len(ref.rect) >= 4 and (float(ref.rect[2]) > float(ref.rect[0]) or float(ref.rect[3]) > float(ref.rect[1])):
+            x = float(ref.rect[0])
+            y = float(ref.rect[1])
+        if x > 0 or y > 0:
+            return f"Jump to page {ref.page}, x {x:.0f}, y {y:.0f}"
+        return f"Jump to page {ref.page}"
+
+    @staticmethod
+    def _plain_text_to_html(text: str) -> str:
+        return html.escape(text).replace("\n", "<br>")
+
+    @staticmethod
+    def _ai_text_to_html(text: str) -> str:
+        placeholders: List[Tuple[str, str]] = []
+
+        def protect(pattern: str, css_class: str, source: str) -> str:
+            def replace(match) -> str:
+                token = f"@@AI_MATH_{len(placeholders)}@@"
+                content = PdfReaderWindow._math_to_display_text(match.group(1).strip())
+                if css_class == "ai-math-block":
+                    html_text = f"<div class='{css_class}'>{html.escape(content)}</div>"
+                else:
+                    html_text = f"<span class='{css_class}'>{html.escape(content)}</span>"
+                placeholders.append((token, html_text))
+                return token
+
+            return re.sub(pattern, replace, source, flags=re.DOTALL)
+
+        protected = PdfReaderWindow._cleanup_broken_latex_text(text)
+        protected = protect(r"\\\[(.*?)\\\]", "ai-math-block", protected)
+        protected = protect(r"\$\$(.*?)\$\$", "ai-math-block", protected)
+        protected = protect(r"\\\((.*?)\\\)", "ai-math-inline", protected)
+        protected = protect(r"(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)", "ai-math-inline", protected)
+
+        html_lines: List[str] = []
+        for line in protected.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                html_lines.append("<div style='height:6px;'></div>")
+            elif PdfReaderWindow._looks_like_formula_line(line):
+                html_lines.append(f"<div class='ai-math-block'>{html.escape(stripped)}</div>")
+            elif re.match(r"^[-*•]\s+", stripped):
+                html_lines.append(f"<div style='margin: 5px 0 5px 0;'>{html.escape(stripped)}</div>")
+            else:
+                html_lines.append(f"<div style='margin: 3px 0;'>{html.escape(stripped)}</div>")
+        out = "".join(html_lines)
+        for token, replacement in placeholders:
+            out = out.replace(html.escape(token), replacement)
+            out = out.replace(token, replacement)
+        return out
+
+    @staticmethod
+    def _cleanup_broken_latex_text(text: str) -> str:
+        out = text
+        # Model/PDF text extraction sometimes drops LaTeX braces and backslashes,
+        # yielding strings like "mathrm3SAT" or "VERTEXtext-COVER".
+        out = out.replace(r"\langle", "⟨").replace(r"\rangle", "⟩")
+        out = out.replace("langle", "⟨").replace("rangle", "⟩")
+        out = out.replace(r"\varphi", "φ").replace(r"\phi", "φ")
+        out = out.replace("varphi", "φ")
+        out = re.sub(r"\\k\b", "k", out)
+        out = re.sub(r"\\?mathrm\s*\{([^{}]+)\}", r"\1", out)
+        out = re.sub(r"\\?text\s*\{([^{}]+)\}", r"\1", out)
+        out = re.sub(r"\\?operatorname\s*\{([^{}]+)\}", r"\1", out)
+        out = re.sub(r"\\?mathsf\s*\{([^{}]+)\}", r"\1", out)
+        out = re.sub(r"\\?mathtt\s*\{([^{}]+)\}", r"\1", out)
+        out = re.sub(r"\\?mathbf\s*\{([^{}]+)\}", r"\1", out)
+        out = re.sub(r"\\?mathrm(?=[A-Za-z0-9])", "", out)
+        out = re.sub(r"\\?text(?=[A-Z0-9-])", "", out)
+        out = re.sub(r"\\?operatorname(?=[A-Za-z0-9])", "", out)
+        out = re.sub(r"\\?mathsf(?=[A-Za-z0-9])", "", out)
+        out = re.sub(r"\\?mathtt(?=[A-Za-z0-9])", "", out)
+        out = re.sub(r"\\?mathbf(?=[A-Za-z0-9])", "", out)
+        return out
+
+    @staticmethod
+    def _looks_like_formula_line(line: str) -> bool:
+        stripped = line.strip()
+        if len(stripped) < 3 or len(stripped) > 220:
+            return False
+        if re.search(r"\[\[\s*C\d+\s*\]\]", stripped):
+            return False
+        if stripped.startswith(("-", "*", "•")):
+            return False
+        math_markers = (
+            "=",
+            "\\frac",
+            "\\sum",
+            "\\int",
+            "\\partial",
+            "\\nabla",
+            "\\alpha",
+            "\\beta",
+            "\\gamma",
+            "\\delta",
+            "\\lambda",
+            "\\omega",
+            "^",
+            "_",
+        )
+        if not any(marker in stripped for marker in math_markers):
+            return False
+        letters = sum(ch.isalpha() for ch in stripped)
+        operators = sum(ch in "=+-*/^_()[]{}<>|\\∂∇∑∫√≈≤≥≠" for ch in stripped)
+        return operators >= 2 and letters <= max(18, len(stripped) * 0.55)
+
+    @staticmethod
+    def _math_to_display_text(text: str) -> str:
+        out = PdfReaderWindow._cleanup_broken_latex_text(text).strip()
+        replacements = {
+            r"\alpha": "α",
+            r"\beta": "β",
+            r"\gamma": "γ",
+            r"\Gamma": "Γ",
+            r"\delta": "δ",
+            r"\Delta": "Δ",
+            r"\epsilon": "ε",
+            r"\varepsilon": "ε",
+            r"\zeta": "ζ",
+            r"\eta": "η",
+            r"\theta": "θ",
+            r"\Theta": "Θ",
+            r"\vartheta": "ϑ",
+            r"\iota": "ι",
+            r"\kappa": "κ",
+            r"\lambda": "λ",
+            r"\Lambda": "Λ",
+            r"\mu": "μ",
+            r"\nu": "ν",
+            r"\xi": "ξ",
+            r"\Xi": "Ξ",
+            r"\pi": "π",
+            r"\Pi": "Π",
+            r"\rho": "ρ",
+            r"\sigma": "σ",
+            r"\Sigma": "Σ",
+            r"\tau": "τ",
+            r"\upsilon": "υ",
+            r"\phi": "φ",
+            r"\varphi": "φ",
+            r"\Phi": "Φ",
+            r"\chi": "χ",
+            r"\psi": "ψ",
+            r"\Psi": "Ψ",
+            r"\omega": "ω",
+            r"\Omega": "Ω",
+            r"\partial": "∂",
+            r"\nabla": "∇",
+            r"\infty": "∞",
+            r"\sum": "∑",
+            r"\prod": "∏",
+            r"\int": "∫",
+            r"\oint": "∮",
+            r"\sqrt": "√",
+            r"\cdot": "·",
+            r"\times": "×",
+            r"\pm": "±",
+            r"\mp": "∓",
+            r"\leq": "≤",
+            r"\le": "≤",
+            r"\geq": "≥",
+            r"\ge": "≥",
+            r"\neq": "≠",
+            r"\ne": "≠",
+            r"\approx": "≈",
+            r"\sim": "∼",
+            r"\propto": "∝",
+            r"\in": "∈",
+            r"\notin": "∉",
+            r"\subset": "⊂",
+            r"\subseteq": "⊆",
+            r"\cup": "∪",
+            r"\cap": "∩",
+            r"\rightarrow": "→",
+            r"\to": "→",
+            r"\leftarrow": "←",
+            r"\Rightarrow": "⇒",
+            r"\Leftarrow": "⇐",
+            r"\leftrightarrow": "↔",
+            r"\forall": "∀",
+            r"\exists": "∃",
+            r"\neg": "¬",
+            r"\land": "∧",
+            r"\lor": "∨",
+        }
+        for source, target in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+            out = out.replace(source, target)
+
+        out = re.sub(r"\\(?:left|right|Bigl|Bigr|bigl|bigr|Big|big)\s*", "", out)
+        out = PdfReaderWindow._replace_latex_groups(out, "frac", lambda a, b: f"({a})⁄({b})")
+        out = PdfReaderWindow._replace_latex_one_group(out, "sqrt", lambda a: f"√({a})")
+        out = PdfReaderWindow._replace_latex_one_group(out, "overline", lambda a: f"overline({a})")
+        out = PdfReaderWindow._replace_latex_scripts(out)
+        out = out.replace(r"\mid", "∣")
+        out = re.sub(r"\\([A-Za-z]+)", r"\1", out)
+        out = out.replace(r"\{", "{").replace(r"\}", "}")
+        out = out.replace("{", "").replace("}", "")
+        out = re.sub(r"\s+", " ", out).strip()
+        return out
+
+    @staticmethod
+    def _replace_latex_groups(text: str, command: str, formatter) -> str:
+        pattern = re.compile(rf"\\{command}\s*\{{([^{{}}]+)\}}\s*\{{([^{{}}]+)\}}")
+        previous = None
+        out = text
+        while previous != out:
+            previous = out
+            out = pattern.sub(lambda match: formatter(match.group(1), match.group(2)), out)
+        return out
+
+    @staticmethod
+    def _replace_latex_one_group(text: str, command: str, formatter) -> str:
+        pattern = re.compile(rf"\\{command}\s*\{{([^{{}}]+)\}}")
+        previous = None
+        out = text
+        while previous != out:
+            previous = out
+            out = pattern.sub(lambda match: formatter(match.group(1)), out)
+        return out
+
+    @staticmethod
+    def _replace_latex_scripts(text: str) -> str:
+        superscript_map = str.maketrans("0123456789+-=()nijk", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱʲᵏ")
+        subscript_map = str.maketrans("0123456789+-=()aeijmnoprstuvx", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑᵢⱼₘₙₒₚᵣₛₜᵤᵥₓ")
+
+        def convert_script(raw: str, table, fallback_prefix: str) -> str:
+            value = raw.strip("{}")
+            converted = value.translate(table)
+            if converted != value:
+                return converted
+            return f"{fallback_prefix}({value})"
+
+        out = re.sub(
+            r"\^\{([^{}]+)\}|\^([A-Za-z0-9+\-=()])",
+            lambda match: convert_script(match.group(1) or match.group(2), superscript_map, "^"),
+            text,
+        )
+        out = re.sub(
+            r"_\{([^{}]+)\}|_([A-Za-z0-9+\-=()])",
+            lambda match: convert_script(match.group(1) or match.group(2), subscript_map, "_"),
+            out,
+        )
+        return out
+
+    def open_ai_reference(self, url: QUrl) -> None:
+        value = url.toString()
+        prefix = "ai-cite:"
+        if not value.startswith(prefix):
+            return
+        anchor_id = value[len(prefix) :]
+        ref = self.ai_reference_map.get(anchor_id)
+        session = self.current_session()
+        if ref is None or session is None:
+            return
+        self.show_reader()
+        self._show_page_for_session(session, ref.page, push_history=True)
+        target_y = ref.y
+        target_x: Optional[float] = ref.x if ref.x > 0 else None
+        if ref.rect and len(ref.rect) >= 4 and (float(ref.rect[2]) > float(ref.rect[0]) or float(ref.rect[3]) > float(ref.rect[1])):
+            target_x = float(ref.rect[0])
+            target_y = float(ref.rect[1])
+        target_x_scene = target_x * RENDER_SCALE if target_x is not None else None
+        self.view.scroll_to_page(ref.page, target_y * RENDER_SCALE, target_x_scene)
+        snippet = " ".join(ref.text.split())
+        if len(snippet) > 120:
+            snippet = snippet[:117] + "..."
+        coordinate_text = f", x {target_x:.0f}, y {target_y:.0f}" if target_x is not None else f", y {target_y:.0f}"
+        self.statusBar().showMessage(
+            f"AI reference: page {ref.page}{coordinate_text} - {snippet}",
+            7000,
+        )
 
     def open_text_search(self) -> None:
         session = self.current_session()
@@ -3309,6 +4453,7 @@ class PdfReaderWindow(QMainWindow):
         self._refresh_bookmarks_panel()
         self._refresh_annotation_overlays(session)
         self._sync_text_search_panel()
+        self._sync_ai_panel()
         if self.search_dock.isVisible() and session.text_search_query and not session.text_search_complete:
             self._text_search_timer.start(0)
         self.view.setFocus()
